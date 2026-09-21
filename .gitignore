@@ -1,0 +1,6 @@
+/target/
+/dist/
+/MH Monitoring ref/
+/.superpowers/
+/assets/presentmon/
+*.log
