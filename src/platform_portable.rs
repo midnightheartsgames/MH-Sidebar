@@ -52,9 +52,9 @@ pub fn monitors() -> Vec<Monitor> {
             let (width, rest) = geometry.split_once('/')?;
             let (_, rest) = rest.split_once('x')?;
             let (height, rest) = rest.split_once('/')?;
-            let offset = rest.find(|value: char| value == '+' || value == '-')?;
+            let offset = rest.find(['+', '-'])?;
             let coords = &rest[offset..];
-            let split = coords[1..].find(|value: char| value == '+' || value == '-')? + 1;
+            let split = coords[1..].find(['+', '-'])? + 1;
             let left: i32 = coords[..split].parse().ok()?;
             let top: i32 = coords[split..].parse().ok()?;
             let width: i32 = width.parse().ok()?;
