@@ -1,7 +1,9 @@
+#[cfg(windows)]
+use crate::settings_ui::DriverAction;
 use crate::{
     analytics_ui::{AnalyticsView, AnalyticsWindow},
     controls::{Command, Controls},
-    settings_ui::{DriverAction, SettingsWindow},
+    settings_ui::SettingsWindow,
     sidebar::{self, Histories},
     theme,
 };
@@ -227,6 +229,7 @@ impl App {
             self.persist();
         }
     }
+    #[cfg(windows)]
     fn driver_action(&mut self, action: DriverAction) {
         let result = match action {
             DriverAction::Install => platform::install_pawnio().map(|_| {
@@ -546,6 +549,7 @@ impl eframe::App for App {
                 self.settings_window.recording = None;
             }
         }
+        #[cfg(windows)]
         if let Some(action) = self.settings_window.action.take() {
             self.driver_action(action);
         }

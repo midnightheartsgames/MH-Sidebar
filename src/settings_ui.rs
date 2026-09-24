@@ -37,6 +37,7 @@ impl Page {
     }
 }
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub enum DriverAction {
     Install,
     OpenSite,
@@ -51,6 +52,7 @@ pub struct SettingsWindow {
     cover: Option<egui::TextureHandle>,
     pub status: Option<String>,
     pub first_run: bool,
+    #[cfg(windows)]
     pub action: Option<DriverAction>,
     profile_name: String,
     pub recording: Option<usize>,
@@ -75,6 +77,7 @@ impl SettingsWindow {
             cover: None,
             status: None,
             first_run,
+            #[cfg(windows)]
             action: None,
             profile_name: String::new(),
             recording: None,

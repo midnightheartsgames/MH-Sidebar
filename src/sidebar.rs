@@ -312,9 +312,9 @@ fn clock(ui: &mut egui::Ui, settings: &Settings, accent: Color32) {
     };
     #[cfg(not(windows))]
     let (hour, minute, second, day, month, year) = {
-        let mut seconds = unsafe { libc::time(std::ptr::null_mut()) };
+        let seconds = unsafe { libc::time(std::ptr::null_mut()) };
         let mut local: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&mut seconds, &mut local) };
+        unsafe { libc::localtime_r(&seconds, &mut local) };
         (
             local.tm_hour,
             local.tm_min,
