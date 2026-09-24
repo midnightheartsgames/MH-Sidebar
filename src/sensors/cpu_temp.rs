@@ -1,58 +1,12 @@
-// MIT License
-//
-// Copyright (c) 2026 midnightheartsgames
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-//
-// ---
-//
-// Third-party components bundled with this software keep their own licenses:
-//
-// - Intel PresentMon 2.5.1 — MIT License, see assets/presentmon/LICENSE.txt
-// - PawnIO modules AMDFamily17 and IntelMSR 0.2.11 — LGPL-2.1-or-later,
-//   see assets/pawnio/COPYING
-// - Cuprum font — SIL Open Font License 1.1, see assets/fonts/OFL.txt
-//
-//! Температура и мощность CPU через PawnIO — перенесено из MH Monitoring
-//! (`crates/sources/src/hardware/{cpuid,amd,amd_sensor,intel,intel_sensor}.rs`).
-//!
-//! Формулы сверены с драйверами Linux `k10temp.c`, `coretemp.c` и `rapl.c`. Модули PawnIO
-//! встроены в исполняемый файл без изменений; происхождение, хеш и лицензия —
-//! `assets/pawnio/NOTICE.md`.
-
 use super::pawnio::{PawnIo, PawnIoError, PciAccessLock};
 use crate::model::DriverStatus;
 
 const AMD_FAMILY17_MODULE: &[u8] = include_bytes!("../../assets/pawnio/AMDFamily17.bin");
 const INTEL_MSR_MODULE: &[u8] = include_bytes!("../../assets/pawnio/IntelMSR.bin");
-
-/// Сколько ждать общий мьютекс PCI. Держат его на время одного чтения: если занят дольше, кто-то
-/// завис, и лучше пропустить показание.
 const PCI_LOCK_TIMEOUT_MS: u32 = 50;
-
-// AMD 17h–1Ah.
-/// SMN-регистр текущей температуры (`ZEN_REPORTED_TEMP_CTRL_BASE` в `k10temp`).
 const ZEN_REPORTED_TEMP_CTRL: u64 = 0x0005_9800;
 const MSR_AMD_RAPL_POWER_UNIT: u64 = 0xC001_0299;
 const MSR_AMD_PKG_ENERGY_STATUS: u64 = 0xC001_029B;
-
-// Intel.
 const MSR_IA32_TEMPERATURE_TARGET: u64 = 0x1A2;
 const MSR_IA32_PACKAGE_THERM_STATUS: u64 = 0x1B1;
 const MSR_IA32_THERM_STATUS: u64 = 0x19C;
@@ -69,21 +23,16 @@ enum Vendor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CpuIdentity {
     vendor: Vendor,
-    /// Итоговое семейство — с учётом расширенного поля.
     family: u32,
     brand: String,
-    /// CPUID.06H:EAX — есть ли цифровой датчик (бит 0) и датчик пакета (бит 6).
     thermal_leaf: u32,
 }
 
 impl CpuIdentity {
-    /// Семейства, которые понимает модуль `AMDFamily17`.
     fn is_amd_zen(&self) -> bool {
         self.vendor == Vendor::Amd && (0x17..=0x1A).contains(&self.family)
     }
 }
-
-/// Семейство из `eax` листа 1: расширенное поле прибавляется только при базовом значении 0xF.
 fn decode_family(eax: u32) -> u32 {
     let base = (eax >> 8) & 0xF;
     if base == 0xF {
@@ -137,9 +86,6 @@ fn identify() -> CpuIdentity {
         thermal_leaf: 0,
     }
 }
-
-/// Tctl в градусах из регистра `ZEN_REPORTED_TEMP_CTRL`, как в `k10temp::get_raw_temp`: старшие
-/// 11 бит — шаг 1/8 °C, и вычитается 49 °C при бите 19 **или** обоих битах 17:16.
 fn decode_tctl(register: u32) -> f64 {
     let mut celsius = f64::from(register >> 21) * 0.125;
     if register & (1 << 19) != 0 || register & (0b11 << 16) == 0b11 << 16 {
@@ -147,9 +93,6 @@ fn decode_tctl(register: u32) -> f64 {
     }
     celsius
 }
-
-/// Сдвиг Tctl относительно температуры кристалла у первых Ryzen (`k10temp::tctl_offset_table`).
-/// Для Zen 3 и новее сдвига нет.
 fn tctl_offset(family: u32, brand: &str) -> f64 {
     const OFFSETS: &[(&str, f64)] = &[
         ("AMD Ryzen 5 1600X", 20.0),
@@ -167,26 +110,18 @@ fn tctl_offset(family: u32, brand: &str) -> f64 {
         .find(|(model, _)| brand.contains(model))
         .map_or(0.0, |(_, offset)| *offset)
 }
-
-/// TjMax из битов 23:16 `IA32_TEMPERATURE_TARGET`; 100 °C, если регистр его не сообщает.
 fn tj_max(temperature_target: u64) -> f64 {
     match (temperature_target >> 16) & 0xFF {
         0 => 100.0,
         value => value as f64,
     }
 }
-
-/// Датчики Intel хранят не градусы, а запас до TjMax в битах 22:16.
 fn intel_temperature(status: u64, tj_max: f64) -> f64 {
     tj_max - ((status >> 16) & 0x7F) as f64
 }
-
-/// Цена деления счётчика энергии: биты 12:8 регистра единиц задают `1 / 2^n` Дж (`rapl.c`).
 fn energy_unit_joules(power_unit_register: u64) -> f64 {
     1.0 / f64::from(2u32).powi(((power_unit_register >> 8) & 0x1F) as i32)
 }
-
-/// Мощность по приросту 32-битного счётчика энергии; переполнение учитывается по модулю 2^32.
 #[derive(Debug, Clone)]
 struct EnergyMeter {
     unit_joules: f64,
@@ -200,9 +135,6 @@ impl EnergyMeter {
             previous: None,
         }
     }
-
-    /// Мощность появляется со второго показания. Интервалы короче 50 мс не считаются — там шум
-    /// сильнее сигнала; больше 1 кВт настольный пакет не потребляет — это испорченное чтение.
     fn update(&mut self, counter: u32, now_ms: u64) -> Option<f64> {
         let Some((previous_counter, previous_ms)) = self.previous else {
             self.previous = Some((counter, now_ms));
@@ -221,7 +153,6 @@ impl EnergyMeter {
 
 enum Kind {
     Amd {
-        /// `None` — the shared PCI mutex is unreachable; SMN is not read without it.
         lock: Option<PciAccessLock>,
         tctl_offset: f64,
     },
@@ -230,8 +161,6 @@ enum Kind {
         package_sensor: bool,
     },
 }
-
-/// Открытый датчик температуры и мощности CPU.
 pub struct CpuSensor {
     pawnio: PawnIo,
     kind: Kind,
@@ -247,7 +176,6 @@ fn status(error: PawnIoError) -> DriverStatus {
 }
 
 impl CpuSensor {
-    /// Открывает PawnIO с модулем под этот процессор. Ошибка — причина, понятная пользователю.
     pub fn open() -> Result<Self, DriverStatus> {
         let cpu = identify();
         let (module, power_unit) = if cpu.is_amd_zen() {
@@ -273,7 +201,6 @@ impl CpuSensor {
                 package_sensor: cpu.thermal_leaf & (1 << 6) != 0,
             }
         };
-        // Единица энергии постоянна. Если не прочиталась, не будет только мощности.
         let meter = pawnio
             .call("ioctl_read_msr", power_unit)
             .ok()
@@ -284,13 +211,10 @@ impl CpuSensor {
             meter,
         })
     }
-
-    /// Температура в °C и мощность пакета в ваттах; каждое может отсутствовать само по себе.
     pub fn read(&mut self, now_ms: u64) -> (Option<f64>, Option<f64>) {
         let msr = |register| self.pawnio.call("ioctl_read_msr", register).ok();
         let (temperature, energy) = match &self.kind {
             Kind::Amd { lock, tctl_offset } => {
-                // Пара «индекс/данные» PCI общая для всей системы — читать только под мьютексом.
                 let tctl = lock
                     .as_ref()
                     .and_then(|lock| {
@@ -311,8 +235,6 @@ impl CpuSensor {
                 let temperature = if *package_sensor {
                     msr(MSR_IA32_PACKAGE_THERM_STATUS).map(|s| intel_temperature(s, *tj_max))
                 } else {
-                    // Старые процессоры без датчика пакета: ядро, на котором выполнилось чтение;
-                    // бит 31 — показание действительно.
                     msr(MSR_IA32_THERM_STATUS)
                         .filter(|s| s & (1 << 31) != 0)
                         .map(|s| intel_temperature(s, *tj_max))
@@ -335,16 +257,15 @@ mod tests {
 
     #[test]
     fn the_bundled_modules_are_the_audited_ones() {
-        // Размеры и хеши зафиксированы в assets/pawnio/NOTICE.md.
         assert_eq!(AMD_FAMILY17_MODULE.len(), 10_652);
         assert_eq!(INTEL_MSR_MODULE.len(), 5_324);
     }
 
     #[test]
     fn signatures_and_vendors_decode() {
-        assert_eq!(decode_family(0x00A2_0F10), 0x19); // Ryzen 9 5900X
-        assert_eq!(decode_family(0x0080_0F11), 0x17); // Ryzen 7 1700
-        assert_eq!(decode_family(0x0009_06ED), 0x6); // Core i9-9900K
+        assert_eq!(decode_family(0x00A2_0F10), 0x19);
+        assert_eq!(decode_family(0x0080_0F11), 0x17);
+        assert_eq!(decode_family(0x0009_06ED), 0x6);
         let word = |t: &[u8]| u32::from_le_bytes(t.try_into().unwrap());
         let text = b"AuthenticAMD";
         assert_eq!(
@@ -401,8 +322,6 @@ mod tests {
             "5 кВт — испорченное чтение"
         );
     }
-
-    /// С установленным PawnIO и правами — правдоподобная температура, иначе — понятная причина.
     #[test]
     fn this_machine_either_reads_or_explains() {
         match CpuSensor::open() {

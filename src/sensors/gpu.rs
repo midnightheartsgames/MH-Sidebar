@@ -1,43 +1,3 @@
-// MIT License
-//
-// Copyright (c) 2026 midnightheartsgames
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-//
-// ---
-//
-// Third-party components bundled with this software keep their own licenses:
-//
-// - Intel PresentMon 2.5.1 — MIT License, see assets/presentmon/LICENSE.txt
-// - PawnIO modules AMDFamily17 and IntelMSR 0.2.11 — LGPL-2.1-or-later,
-//   see assets/pawnio/COPYING
-// - Cuprum font — SIL Open Font License 1.1, see assets/fonts/OFL.txt
-//
-//! Видеокарты через ядро графики Windows (D3DKMT) — для любого производителя.
-//!
-//! Отсюда же берёт данные диспетчер задач: имя, объём видеопамяти, температура, обороты
-//! вентилятора и частоты. Прав администратора не нужно, работает и из службы. Драйвер сообщает
-//! только то, что поддерживает (WDDM 2.4+), — чего нет, то `None`.
-//!
-//! Загрузка и занятая видеопамять здесь не читаются: их отдают счётчики PDH `GPU Engine` и
-//! `GPU Adapter Memory`, экземпляры которых помечены LUID адаптера — см. [`Luid::pdh_tag`].
-
 use windows_sys::Wdk::Graphics::Direct3D::{
     D3DKMT_ADAPTER_PERFDATA, D3DKMT_ADAPTER_PERFDATACAPS, D3DKMT_ADAPTERINFO,
     D3DKMT_ADAPTERREGISTRYINFO, D3DKMT_CLOSEADAPTER, D3DKMT_ENUMADAPTERS2, D3DKMT_NODE_PERFDATA,
@@ -50,11 +10,7 @@ use windows_sys::Wdk::Graphics::Direct3D::{
 use windows_sys::Win32::Foundation::LUID;
 
 use super::from_wide;
-
-/// Бит `SoftwareDevice` в `D3DKMT_ADAPTERTYPE`: Microsoft Basic Render Driver и подобные.
 const ADAPTER_TYPE_SOFTWARE: u32 = 1 << 2;
-
-/// Идентификатор адаптера, стабильный до перезагрузки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Luid {
     pub high: i32,
@@ -62,7 +18,6 @@ pub struct Luid {
 }
 
 impl Luid {
-    /// Как LUID пишется в именах экземпляров PDH: `luid_0x00000000_0x0000D1F2`.
     pub fn pdh_tag(self) -> String {
         format!("luid_0x{:08x}_0x{:08x}", self.high as u32, self.low)
     }
@@ -74,18 +29,15 @@ impl Luid {
         }
     }
 }
-
-/// Что известно об адаптере без опроса датчиков.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterInfo {
     pub luid: Luid,
+    pub device_id: String,
+    pub pci_address: Option<(u32, u32, u32)>,
     pub name: String,
     pub dedicated_memory_bytes: Option<u64>,
-    /// Программный рендер — не видеокарта.
     pub software: bool,
 }
-
-/// Все адаптеры, которые видит ядро графики.
 pub fn adapters() -> Vec<AdapterInfo> {
     let mut request = D3DKMT_ENUMADAPTERS2 {
         NumAdapters: 0,
@@ -100,7 +52,6 @@ pub fn adapters() -> Vec<AdapterInfo> {
         return Vec::new();
     }
     list.truncate(request.NumAdapters as usize);
-    // Перечисление открывает каждый адаптер — закрыть все, даже если о каком-то ничего не узнали.
     let found = list
         .iter()
         .map(|entry| {
@@ -116,8 +67,36 @@ pub fn adapters() -> Vec<AdapterInfo> {
                 Default::default(),
             );
             let kind: Option<u32> = query(entry.hAdapter, KMTQAITYPE_ADAPTERTYPE, 0);
+            use windows_sys::Wdk::Graphics::Direct3D::{
+                D3DKMT_ADAPTERADDRESS, KMTQAITYPE_ADAPTERADDRESS,
+            };
+            use windows_sys::Win32::Devices::Display::{
+                DISPLAYCONFIG_ADAPTER_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
+                DisplayConfigGetDeviceInfo,
+            };
+            let address: Option<D3DKMT_ADAPTERADDRESS> = query(
+                entry.hAdapter,
+                KMTQAITYPE_ADAPTERADDRESS,
+                Default::default(),
+            );
+            let mut path = DISPLAYCONFIG_ADAPTER_NAME::default();
+            path.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
+            path.header.size = std::mem::size_of_val(&path) as u32;
+            path.header.adapterId = entry.AdapterLuid;
+            let device_id = if unsafe { DisplayConfigGetDeviceInfo(&mut path.header) } == 0
+                && path.adapterDevicePath[0] != 0
+            {
+                format!(
+                    "gpu:windows:{}",
+                    from_wide(&path.adapterDevicePath).to_lowercase()
+                )
+            } else {
+                format!("unstable:gpu:{}", luid.pdh_tag())
+            };
             AdapterInfo {
                 luid,
+                device_id,
+                pci_address: address.map(|a| (a.BusNumber, a.DeviceNumber, a.FunctionNumber)),
                 name: registry
                     .map(|info| from_wide(&info.AdapterString))
                     .unwrap_or_default(),
@@ -134,18 +113,13 @@ pub fn adapters() -> Vec<AdapterInfo> {
     }
     found
 }
-
-/// Показания датчиков адаптера. `None` — драйвер это поле не сообщает.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AdapterPerf {
     pub temperature_c: Option<f64>,
     pub fan_rpm: Option<u32>,
     pub memory_frequency_mhz: Option<f64>,
-    /// Частота графического ядра — узла 0, на котором у всех драйверов работает 3D.
     pub core_frequency_mhz: Option<f64>,
 }
-
-/// Открытый адаптер для периодического опроса.
 pub struct Adapter {
     handle: u32,
     has_temperature: bool,
@@ -161,8 +135,6 @@ impl Adapter {
         if unsafe { D3DKMTOpenAdapterFromLuid(&mut request) } < 0 {
             return None;
         }
-        // Нули в показаниях неоднозначны: 0 об/мин — это и «вентилятор стоит», и «нет датчика».
-        // Возможности адаптера это различают.
         let caps: Option<D3DKMT_ADAPTER_PERFDATACAPS> = query(
             request.hAdapter,
             KMTQAITYPE_ADAPTERPERFDATA_CAPS,
@@ -182,7 +154,6 @@ impl Adapter {
             query(self.handle, KMTQAITYPE_NODEPERFDATA, Default::default());
         let hz_to_mhz = |hz: u64| (hz > 0).then(|| hz as f64 / 1_000_000.0);
         AdapterPerf {
-            // Десятые доли градуса.
             temperature_c: adapter
                 .filter(|_| self.has_temperature)
                 .map(|data| f64::from(data.Temperature) / 10.0),
@@ -201,11 +172,7 @@ impl Drop for Adapter {
         unsafe { D3DKMTCloseAdapter(&close) };
     }
 }
-
-// Дескриптор адаптера — число ядра, к потоку не привязан.
 unsafe impl Send for Adapter {}
-
-/// `D3DKMTQueryAdapterInfo` с буфером типа `T`. Входные поля (индекс адаптера, узла) — нули.
 fn query<T: Copy>(handle: u32, kind: KMTQUERYADAPTERINFOTYPE, mut buffer: T) -> Option<T> {
     let mut request = D3DKMT_QUERYADAPTERINFO {
         hAdapter: handle,
@@ -217,7 +184,6 @@ fn query<T: Copy>(handle: u32, kind: KMTQUERYADAPTERINFOTYPE, mut buffer: T) -> 
 }
 
 fn zeroed<T: Copy>() -> T {
-    // SAFETY: только для C-структур из чисел и массивов чисел.
     unsafe { std::mem::zeroed() }
 }
 
@@ -240,11 +206,6 @@ mod tests {
             "luid_0xffffffff_0x00000001"
         );
     }
-
-    /// На любой Windows есть хотя бы программный адаптер; на машине разработчика — и настоящая
-    /// карта с именем и памятью. У виртуального адаптера машины CI (GitHub Actions) нет ни
-    /// имени, ни памяти, и программным он себя не называет: имя проверяется только у карты с
-    /// памятью.
     #[test]
     #[ignore = "requires a desktop GPU driver; run explicitly on hardware"]
     fn adapters_are_listed_and_can_be_opened() {

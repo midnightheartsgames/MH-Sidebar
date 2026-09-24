@@ -1,4 +1,3 @@
-//! MH Monitoring palette and Cuprum typography (MIT, midnightheartsgames).
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke,
 };

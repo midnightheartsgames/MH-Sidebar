@@ -1,5 +1,3 @@
-//! Debug-build visual QA hook: captures only this application's egui framebuffer.
-//! Opt in by setting MH_SIDEBAR_CAPTURE_DIR to a local output directory.
 pub fn frame(ui: &eframe::egui::Ui, name: &str, now: f64) {
     use eframe::egui::{self, ViewportCommand};
     let Some(dir) = std::env::var_os("MH_SIDEBAR_CAPTURE_DIR") else {
@@ -36,10 +34,7 @@ pub fn frame(ui: &eframe::egui::Ui, name: &str, now: f64) {
         }
     });
 }
-
-/// egui 0.36 does not process Screenshot actions for immediate child viewports.
-/// Their GL surface is still current immediately after show_viewport_immediate.
-pub fn immediate(ctx: &eframe::egui::Context, gl: &eframe::glow::Context, now: f64) {
+pub fn immediate(ctx: &eframe::egui::Context, gl: &eframe::glow::Context, now: f64, name: &str) {
     use eframe::{
         egui,
         glow::{self, HasContext},
@@ -47,7 +42,7 @@ pub fn immediate(ctx: &eframe::egui::Context, gl: &eframe::glow::Context, now: f
     let Some(dir) = std::env::var_os("MH_SIDEBAR_CAPTURE_DIR") else {
         return;
     };
-    let id = egui::Id::new("settings-captured");
+    let id = egui::Id::new(("viewport-captured", name));
     if now < 4. || ctx.data(|d| d.get_temp::<bool>(id).unwrap_or(false)) {
         return;
     }
@@ -77,7 +72,7 @@ pub fn immediate(ctx: &eframe::egui::Context, gl: &eframe::glow::Context, now: f
     image::imageops::flip_vertical_in_place(&mut image);
     let dir = std::path::PathBuf::from(dir);
     let _ = std::fs::create_dir_all(&dir);
-    if image.save(dir.join("settings.png")).is_ok() {
+    if image.save(dir.join(format!("{name}.png"))).is_ok() {
         ctx.data_mut(|d| d.insert_temp(id, true));
     }
 }

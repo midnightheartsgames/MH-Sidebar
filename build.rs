@@ -6,9 +6,14 @@ fn main() {
         return;
     }
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let manifest =
+    let manifest_template =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("assets/app.manifest");
-    // Small code-native bar-chart icon, matching the tray mark; no bitmap tools or external assets.
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let manifest = out.join("mh-sidebar.manifest");
+    let manifest_contents = std::fs::read_to_string(manifest_template)
+        .unwrap()
+        .replace("{version}", &version);
+    std::fs::write(&manifest, manifest_contents).unwrap();
     let mut icon = Vec::new();
     for n in [0u16, 1, 1] {
         icon.extend(n.to_le_bytes());
@@ -42,7 +47,6 @@ fn main() {
     let icon_path = out.join("mh-sidebar.ico");
     std::fs::write(&icon_path, icon).unwrap();
     let escaped = |p: &PathBuf| p.display().to_string().replace('\\', "\\\\");
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     let numeric = format!("{},0", version.replace('.', ","));
     let rc = format!(
         r#"#pragma code_page(65001)

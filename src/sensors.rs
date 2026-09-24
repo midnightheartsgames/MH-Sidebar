@@ -45,17 +45,19 @@ mod tests {
     }
 }
 
-use crate::model::{Block, DriverStatus, Reading, Section, Snapshot};
+use crate::model::{Block, Reading, Section, Snapshot, Source};
 use nvml_wrapper::{
     Nvml,
     enum_wrappers::device::{Clock, TemperatureSensor},
 };
 use std::{collections::HashMap, time::Instant};
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, System};
 mod cpu_temp;
 mod gpu;
+mod identity;
 mod pawnio;
 mod pdh;
+mod recovery;
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -85,20 +87,19 @@ fn ratio(a: u64, b: u64) -> Option<f64> {
 pub struct Sampler {
     system: System,
     disks: Disks,
-    networks: Networks,
     start: Instant,
     cpu_at: Option<Instant>,
     rates: HashMap<String, (Rate, Rate)>,
     nvml: Option<Nvml>,
-    refresh_at: Option<Instant>,
+    refresh_at: HashMap<Source, Instant>,
     adapters: Vec<(gpu::AdapterInfo, Option<gpu::Adapter>)>,
     engines: Option<pdh::CounterQuery>,
     gpu_memory: Option<pdh::CounterQuery>,
     disk_read: Option<pdh::CounterQuery>,
     disk_write: Option<pdh::CounterQuery>,
-    pdh_ready: bool,
-    cpu_sensor: Option<cpu_temp::CpuSensor>,
-    cpu_driver: DriverStatus,
+    gpu_ready: bool,
+    disk_ready: bool,
+    cpu_sensor: recovery::CpuRecovery<cpu_temp::CpuSensor>,
 }
 impl Default for Sampler {
     fn default() -> Self {
@@ -110,69 +111,68 @@ impl Sampler {
         Self {
             system: System::new(),
             disks: Disks::new(),
-            networks: Networks::new(),
             start: Instant::now(),
             cpu_at: None,
             rates: HashMap::new(),
             nvml: None,
-            refresh_at: None,
+            refresh_at: HashMap::new(),
             adapters: vec![],
             engines: None,
             gpu_memory: None,
             disk_read: None,
             disk_write: None,
-            pdh_ready: false,
-            cpu_sensor: None,
-            cpu_driver: DriverStatus::Unknown,
+            gpu_ready: false,
+            disk_ready: false,
+            cpu_sensor: recovery::CpuRecovery::default(),
+        }
+    }
+    fn refresh_due(&mut self, source: Source) -> bool {
+        let now = Instant::now();
+        if self
+            .refresh_at
+            .get(&source)
+            .is_none_or(|at| now.duration_since(*at) >= Duration::from_secs(30))
+        {
+            self.refresh_at.insert(source, now);
+            true
+        } else {
+            false
         }
     }
     pub fn sample(&mut self) -> Snapshot {
-        let now = Instant::now();
-        let refresh = self
-            .refresh_at
-            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(30));
-        if refresh {
-            self.refresh_at = Some(now);
-            self.disks.refresh(true);
-            if self.nvml.is_none() {
-                self.nvml = Nvml::init().ok();
-            }
-            self.adapters = gpu::adapters()
-                .into_iter()
-                .filter(|a| !a.software)
-                .map(|a| {
-                    let handle = gpu::Adapter::open(a.luid);
-                    (a, handle)
-                })
-                .collect();
-            for (query, path) in [
-                (&mut self.engines, r"\GPU Engine(*)\Utilization Percentage"),
-                (
-                    &mut self.gpu_memory,
-                    r"\GPU Adapter Memory(*)\Dedicated Usage",
-                ),
-                (&mut self.disk_read, r"\LogicalDisk(*)\Disk Read Bytes/sec"),
-                (
-                    &mut self.disk_write,
-                    r"\LogicalDisk(*)\Disk Write Bytes/sec",
-                ),
-            ] {
-                if query.is_none() {
-                    *query = pdh::CounterQuery::open(&[path]).ok();
-                }
-            }
-            // Retried on the slow refresh so a freshly installed driver is picked up without restart.
-            if self.cpu_sensor.is_none() && self.cpu_driver != DriverStatus::Unsupported {
-                match cpu_temp::CpuSensor::open() {
-                    Ok(sensor) => {
-                        self.cpu_sensor = Some(sensor);
-                        self.cpu_driver = DriverStatus::Ready;
-                    }
-                    Err(status) => self.cpu_driver = status,
-                }
+        let mut combined = Snapshot::default();
+        for source in Source::ALL {
+            match self.sample_source(source) {
+                Ok(snapshot) => combined.merge(snapshot),
+                Err(error) => combined.sources.push(crate::model::SourceStatus {
+                    source,
+                    age: None,
+                    stale: true,
+                    error: Some(error),
+                }),
             }
         }
-        self.system.refresh_memory();
+        combined
+    }
+    pub fn sample_source(&mut self, source: Source) -> Result<Snapshot, String> {
+        let mut snapshot = match source {
+            Source::Cpu => self.cpu(),
+            Source::CpuDriver => self.cpu_driver(),
+            Source::Memory => self.memory(),
+            Source::Gpu => self.gpu(),
+            Source::Disks => self.disks(),
+            Source::Network => self.network()?,
+        };
+        let at = Instant::now();
+        for section in &mut snapshot.sections {
+            for row in &mut section.rows {
+                row.sampled_at = Some(at);
+            }
+        }
+        Ok(snapshot)
+    }
+    fn cpu(&mut self) -> Snapshot {
+        let now = Instant::now();
         let cpu_ready = self
             .cpu_at
             .is_some_and(|t| now.duration_since(t) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
@@ -193,19 +193,6 @@ impl Sampler {
             .map(|c| c.frequency())
             .filter(|v| *v > 0);
         cpu.push(row("clock", "Частота ОС", clock.map(|v| v as f64), "MHz"));
-        let (temperature, power) = self.cpu_sensor.as_mut().map_or((None, None), |s| {
-            s.read(now.duration_since(self.start).as_millis() as u64)
-        });
-        for (key, label, value, unit) in [
-            ("temperature", "Температура", temperature, "°C"),
-            ("power", "Мощность", power, "W"),
-        ] {
-            let mut reading = row(key, label, value, unit);
-            if reading.value.is_none() && self.cpu_driver != DriverStatus::Ready {
-                reading.reason = Some(self.cpu_driver.reason().into());
-            }
-            cpu.push(reading);
-        }
         for (i, c) in self.system.cpus().iter().enumerate() {
             cpu.push(row(
                 &format!("core_{i}"),
@@ -221,16 +208,60 @@ impl Sampler {
             .map(|c| c.brand())
             .unwrap_or("CPU")
             .to_string();
-        let total = self.system.total_memory();
-        let used = self.system.used_memory();
-        let mut sections = vec![
-            Section {
+
+        Snapshot {
+            sections: vec![Section {
+                disconnected: false,
                 id: Block::Cpu,
+                device_id: "cpu:system".into(),
                 device: name,
                 rows: cpu,
-            },
-            Section {
+            }],
+            ..Default::default()
+        }
+    }
+    fn cpu_driver(&mut self) -> Snapshot {
+        let mut cpu = Vec::new();
+        let cpu_time = self.start.elapsed();
+        let (temperature, power) = self.cpu_sensor.sample(
+            cpu_time,
+            cpu_temp::CpuSensor::open,
+            cpu_temp::CpuSensor::read,
+        );
+        let cpu_diagnostic = self.cpu_sensor.diagnostic(cpu_time);
+        for (key, label, value, unit) in [
+            ("temperature", "Температура", temperature, "°C"),
+            ("power", "Мощность", power, "W"),
+        ] {
+            let mut reading = row(key, label, value, unit);
+            if reading.value.is_none() {
+                reading.reason = Some(format!("{label}: показание недоступно. {cpu_diagnostic}"));
+            }
+            cpu.push(reading);
+        }
+
+        Snapshot {
+            sections: vec![Section {
+                disconnected: false,
+                id: Block::Cpu,
+                device_id: "cpu:system".into(),
+                device: "Процессор".into(),
+                rows: cpu,
+            }],
+            cpu_driver: self.cpu_sensor.status,
+            cpu_diagnostic,
+            ..Default::default()
+        }
+    }
+    fn memory(&mut self) -> Snapshot {
+        self.system.refresh_memory();
+        let total = self.system.total_memory();
+        let used = self.system.used_memory();
+        Snapshot {
+            sections: vec![Section {
+                disconnected: false,
                 id: Block::Memory,
+                device_id: "memory:system".into(),
                 device: "Оперативная память".into(),
                 rows: vec![
                     row("load", "Загрузка", ratio(used, total), "%"),
@@ -243,18 +274,36 @@ impl Sampler {
                     ),
                     row("total", "Всего", Some(total as f64 / GIB), "GiB"),
                 ],
-            },
-        ];
-        let collect = |q: &mut Option<pdh::CounterQuery>| {
-            q.as_mut()
-                .and_then(|q| q.collect().ok().map(|_| q.instances(0)))
-                .unwrap_or_default()
-        };
+            }],
+            ..Default::default()
+        }
+    }
+    fn gpu(&mut self) -> Snapshot {
+        if self.refresh_due(Source::Gpu) {
+            if self.nvml.is_none() {
+                self.nvml = Nvml::init().ok();
+            }
+            self.adapters = gpu::adapters()
+                .into_iter()
+                .filter(|a| !a.software)
+                .map(|a| {
+                    let handle = gpu::Adapter::open(a.luid);
+                    (a, handle)
+                })
+                .collect();
+            if self.engines.is_none() {
+                self.engines =
+                    pdh::CounterQuery::open(&[r"\GPU Engine(*)\Utilization Percentage"]).ok();
+            }
+            if self.gpu_memory.is_none() {
+                self.gpu_memory =
+                    pdh::CounterQuery::open(&[r"\GPU Adapter Memory(*)\Dedicated Usage"]).ok();
+            }
+        }
         let engines = collect(&mut self.engines);
         let memory = collect(&mut self.gpu_memory);
-        let reads = collect(&mut self.disk_read);
-        let writes = collect(&mut self.disk_write);
-        let mut nv_names = vec![];
+        let mut sections = Vec::new();
+        let mut nv_ids = std::collections::HashSet::new();
         let mut nv_failed = false;
         if let Some(nv) = &self.nvml {
             match nv.device_count() {
@@ -264,10 +313,33 @@ impl Sampler {
                             continue;
                         };
                         let name = d.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}"));
-                        nv_names.push(name.clone());
+                        let pci = d.pci_info().ok();
+                        let matched = pci.as_ref().and_then(|pci| {
+                            let function = pci
+                                .bus_id
+                                .rsplit('.')
+                                .next()
+                                .and_then(|f| u32::from_str_radix(f, 16).ok())?;
+                            if pci.domain != 0 {
+                                return None;
+                            }
+                            let mut matches = self.adapters.iter().filter(|(a, _)| {
+                                a.pci_address == Some((pci.bus, pci.device, function))
+                            });
+                            let first = matches.next()?;
+                            matches.next().is_none().then_some(&first.0)
+                        });
+                        let device_id = matched.map(|a| a.device_id.clone()).unwrap_or_else(|| {
+                            d.uuid()
+                                .map(|uuid| format!("gpu:nvml:{}", uuid.to_lowercase()))
+                                .unwrap_or_else(|_| format!("unstable:gpu:nvml:{i}"))
+                        });
+                        nv_ids.insert(device_id.clone());
                         let mem = d.memory_info().ok();
                         sections.push(Section {
+                            disconnected: false,
                             id: Block::Gpu,
+                            device_id,
                             device: format!("{name} · NVIDIA {i}"),
                             rows: vec![
                                 row(
@@ -324,11 +396,7 @@ impl Sampler {
             self.nvml = None;
         }
         for (info, adapter) in &self.adapters {
-            if let Some(index) = nv_names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(&info.name))
-            {
-                nv_names.remove(index);
+            if nv_ids.contains(&info.device_id) {
                 continue;
             }
             let perf = adapter.as_ref().map(|a| a.perf()).unwrap_or_default();
@@ -343,7 +411,7 @@ impl Sampler {
                 }
             }
             let load = self
-                .pdh_ready
+                .gpu_ready
                 .then(|| sums.values().copied().reduce(f64::max))
                 .flatten()
                 .map(|v| v.clamp(0.0, 100.0));
@@ -353,7 +421,9 @@ impl Sampler {
                 .map(|(_, v)| *v)
                 .reduce(|a, b| a + b);
             sections.push(Section {
+                disconnected: false,
                 id: Block::Gpu,
+                device_id: info.device_id.clone(),
                 device: format!("{} · {}", info.name, tag),
                 rows: vec![
                     row("load", "Загрузка", load, "%"),
@@ -384,7 +454,9 @@ impl Sampler {
         }
         if !sections.iter().any(|s| s.id == Block::Gpu) {
             sections.push(Section {
+                disconnected: false,
                 id: Block::Gpu,
+                device_id: "unstable:gpu".into(),
                 device: "Видеокарта".into(),
                 rows: vec![Reading::unavailable(
                     "load",
@@ -393,6 +465,28 @@ impl Sampler {
                 )],
             });
         }
+
+        self.gpu_ready = true;
+        Snapshot {
+            sections,
+            ..Default::default()
+        }
+    }
+    fn disks(&mut self) -> Snapshot {
+        if self.refresh_due(Source::Disks) {
+            self.disks.refresh(true);
+            if self.disk_read.is_none() {
+                self.disk_read =
+                    pdh::CounterQuery::open(&[r"\LogicalDisk(*)\Disk Read Bytes/sec"]).ok();
+            }
+            if self.disk_write.is_none() {
+                self.disk_write =
+                    pdh::CounterQuery::open(&[r"\LogicalDisk(*)\Disk Write Bytes/sec"]).ok();
+            }
+        }
+        let reads = collect(&mut self.disk_read);
+        let writes = collect(&mut self.disk_write);
+        let mut sections = Vec::new();
         for disk in self.disks.list_mut() {
             disk.refresh();
             let valid = unsafe {
@@ -408,7 +502,7 @@ impl Sampler {
             let mount = disk.mount_point().to_string_lossy().to_string();
             let pdh_name = mount.trim_end_matches('\\');
             let rate = |values: &[(String, f64)]| {
-                self.pdh_ready
+                self.disk_ready
                     .then(|| {
                         values
                             .iter()
@@ -435,49 +529,62 @@ impl Sampler {
                 }
             }
             sections.push(Section {
+                disconnected: false,
                 id: Block::Disks,
+                device_id: identity::volume_id(&mount),
                 device: format!("{} {}", mount, disk.name().to_string_lossy()),
                 rows,
             });
         }
-        self.networks.refresh(true);
-        let time = self.start.elapsed();
-        self.rates
-            .retain(|name, _| self.networks.contains_key(name));
-        for (name, data) in &self.networks {
-            if name.to_lowercase().contains("loopback") {
-                continue;
-            }
-            let rates = self.rates.entry(name.clone()).or_default();
-            sections.push(Section {
-                id: Block::Network,
-                device: name.clone(),
-                rows: vec![
-                    row(
-                        "download",
-                        "Приём",
-                        rates.0.update(data.total_received(), time),
-                        "MiB/s",
-                    ),
-                    row(
-                        "upload",
-                        "Передача",
-                        rates.1.update(data.total_transmitted(), time),
-                        "MiB/s",
-                    ),
-                ],
-            });
-        }
-        self.pdh_ready = true;
-        sections.sort_by(|a, b| {
-            let order = |b: Block| Block::ALL.iter().position(|x| *x == b).unwrap();
-            order(a.id).cmp(&order(b.id)).then(a.device.cmp(&b.device))
-        });
+
+        self.disk_ready = true;
         Snapshot {
             sections,
-            cpu_driver: self.cpu_driver,
+            ..Default::default()
         }
     }
+    fn network(&mut self) -> Result<Snapshot, String> {
+        let devices = identity::networks()?;
+        let time = self.start.elapsed();
+        self.rates
+            .retain(|id, _| devices.iter().any(|d| &d.id == id));
+        let sections = devices
+            .into_iter()
+            .map(|d| {
+                let rates = self.rates.entry(d.id.clone()).or_default();
+                Section {
+                    disconnected: false,
+                    id: Block::Network,
+                    device_id: d.id,
+                    device: d.name,
+                    rows: vec![
+                        row(
+                            "download",
+                            "Приём",
+                            rates.0.update(d.received, time),
+                            "MiB/s",
+                        ),
+                        row(
+                            "upload",
+                            "Передача",
+                            rates.1.update(d.transmitted, time),
+                            "MiB/s",
+                        ),
+                    ],
+                }
+            })
+            .collect();
+        Ok(Snapshot {
+            sections,
+            ..Default::default()
+        })
+    }
+}
+fn collect(query: &mut Option<pdh::CounterQuery>) -> Vec<(String, f64)> {
+    query
+        .as_mut()
+        .and_then(|q| q.collect().ok().map(|_| q.instances(0)))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -501,5 +608,46 @@ mod fallback_probe {
         for row in &gpu.rows {
             assert!(row.value.is_some_and(f64::is_finite) || row.reason.is_some());
         }
+    }
+    #[test]
+    #[ignore = "requires live Windows storage, network and GPU providers"]
+    fn stable_ids_are_unique_and_gpu_backends_agree_on_this_machine() {
+        let mut sampler = Sampler::new();
+        let first = sampler.sample();
+        let mut ids = std::collections::HashSet::new();
+        for section in &first.sections {
+            println!(
+                "{:?}: {} -> {}",
+                section.id, section.device, section.device_id
+            );
+            assert!(
+                ids.insert((section.id, section.device_id.clone())),
+                "duplicate device ID"
+            );
+            if matches!(section.id, Block::Disks | Block::Network) {
+                assert!(
+                    !section.device_id.starts_with("unstable:"),
+                    "stable identity unavailable on this machine"
+                );
+            }
+        }
+        let gpu_ids: Vec<_> = first
+            .sections
+            .iter()
+            .filter(|s| s.id == Block::Gpu)
+            .map(|s| s.device_id.clone())
+            .collect();
+        assert!(!gpu_ids.is_empty());
+        sampler.nvml = None;
+        let fallback = sampler.sample_source(Source::Gpu).unwrap();
+        let fallback_ids: Vec<_> = fallback
+            .sections
+            .iter()
+            .map(|s| s.device_id.clone())
+            .collect();
+        assert_eq!(
+            gpu_ids, fallback_ids,
+            "NVML and WDDM must resolve the same physical adapters"
+        );
     }
 }

@@ -1,5 +1,9 @@
-use crate::model::Block;
+use crate::model::{Block, Reading, Section, Snapshot};
 use serde::{Deserialize, Serialize};
+mod alerts;
+mod profiles;
+pub use alerts::AlertRule;
+pub use profiles::{Density, PanelProfile, Preset};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -21,8 +25,9 @@ pub struct BlockConfig {
     pub graph: bool,
     pub graph_metric: String,
     pub hidden_rows: Vec<String>,
-    /// Empty selects all detected devices; otherwise exact device names.
+    pub row_order: Vec<String>,
     pub devices: Vec<String>,
+    pub device_ids: Vec<String>,
 }
 impl Default for BlockConfig {
     fn default() -> Self {
@@ -42,16 +47,61 @@ impl BlockConfig {
                 "load".into()
             },
             hidden_rows: Vec::new(),
+            row_order: Vec::new(),
             devices: Vec::new(),
+            device_ids: Vec::new(),
         }
     }
     pub fn shows(&self, key: &str) -> bool {
         !self.hidden_rows.iter().any(|k| k == key)
     }
+    pub fn all_devices(&self) -> bool {
+        self.devices.is_empty() && self.device_ids.is_empty()
+    }
+    pub fn selects(&self, section: &Section) -> bool {
+        self.id == section.id
+            && (self.all_devices() || self.device_ids.contains(&section.device_id))
+    }
     pub fn set_row(&mut self, key: &str, visible: bool) {
         self.hidden_rows.retain(|k| k != key);
         if !visible {
             self.hidden_rows.push(key.into());
+        }
+    }
+    pub fn row_group(key: &str) -> &str {
+        if key.starts_with("core_") {
+            "core_*"
+        } else {
+            key
+        }
+    }
+    pub fn row_position(&self, key: &str) -> usize {
+        self.row_order
+            .iter()
+            .position(|saved| saved == Self::row_group(key))
+            .unwrap_or(usize::MAX)
+    }
+    pub fn ordered_rows<'a>(&self, rows: &'a [Reading]) -> Vec<&'a Reading> {
+        let mut ordered: Vec<_> = rows.iter().collect();
+        ordered.sort_by_key(|row| self.row_position(&row.key));
+        ordered
+    }
+    pub fn move_row(&mut self, key: &str, target: usize, available: &[String]) {
+        if target >= available.len() {
+            return;
+        }
+        let mut ordered = available.to_vec();
+        ordered.sort_by_key(|key| self.row_position(key));
+        if let Some(from) = ordered.iter().position(|current| current == key) {
+            let moved = ordered.remove(from);
+            ordered.insert(target, moved);
+            ordered.extend(
+                self.row_order
+                    .iter()
+                    .filter(|saved| !available.contains(saved))
+                    .cloned(),
+            );
+            self.row_order = ordered;
         }
     }
 }
@@ -75,6 +125,33 @@ impl Default for Hotkeys {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TemperatureLimits {
+    pub warning: f64,
+    pub critical: f64,
+}
+impl Default for TemperatureLimits {
+    fn default() -> Self {
+        Self {
+            warning: 80.,
+            critical: 90.,
+        }
+    }
+}
+impl TemperatureLimits {
+    fn normalize(&mut self) {
+        if !self.warning.is_finite() {
+            self.warning = 80.;
+        }
+        if !self.critical.is_finite() {
+            self.critical = 90.;
+        }
+        self.warning = self.warning.clamp(30., 110.);
+        self.critical = self.critical.clamp(self.warning + 1., 120.);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub schema_version: u32,
     pub monitor_id: String,
@@ -88,6 +165,8 @@ pub struct Settings {
     pub interval_ms: u64,
     pub opacity: f32,
     pub font_size: f32,
+    pub density: Density,
+    pub profiles: Vec<PanelProfile>,
     pub background: [u8; 3],
     pub accent: [u8; 3],
     pub show_header: bool,
@@ -100,13 +179,16 @@ pub struct Settings {
     pub blocks: Vec<BlockConfig>,
     pub hotkeys: Hotkeys,
     pub alerts: bool,
+    pub notifications_enabled: bool,
+    pub alert_rules: Vec<AlertRule>,
     pub warning_temperature: f64,
     pub critical_temperature: f64,
+    pub cpu_temperature: Option<TemperatureLimits>,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 4,
             monitor_id: String::new(),
             side: Side::Right,
             width: 280.,
@@ -114,10 +196,12 @@ impl Default for Settings {
             visible: true,
             always_on_top: false,
             locked: false,
-            autostart: false,
+            autostart: true,
             interval_ms: 1000,
             opacity: 0.94,
             font_size: 16.,
+            density: Density::default(),
+            profiles: Vec::new(),
             background: [11, 11, 13],
             accent: [63, 208, 216],
             show_header: true,
@@ -130,8 +214,11 @@ impl Default for Settings {
             blocks: Block::ALL.into_iter().map(BlockConfig::new).collect(),
             hotkeys: Hotkeys::default(),
             alerts: true,
+            notifications_enabled: false,
+            alert_rules: Vec::new(),
             warning_temperature: 80.,
             critical_temperature: 90.,
+            cpu_temperature: None,
         }
     }
 }
@@ -152,6 +239,7 @@ pub fn default_path() -> PathBuf {
 
 impl Settings {
     pub fn normalize(&mut self) {
+        self.schema_version = 4;
         self.width = finite(self.width, 280.).clamp(220., 480.);
         self.font_size = finite(self.font_size, 16.).clamp(12., 26.);
         self.opacity = finite(self.opacity, 0.94).clamp(0.1, 1.);
@@ -167,6 +255,12 @@ impl Settings {
         self.critical_temperature = self
             .critical_temperature
             .clamp(self.warning_temperature + 1., 120.);
+        self.cpu_temperature
+            .get_or_insert(TemperatureLimits {
+                warning: self.warning_temperature,
+                critical: self.critical_temperature,
+            })
+            .normalize();
         let mut seen = Vec::new();
         self.blocks.retain(|b| {
             if seen.contains(&b.id) {
@@ -181,9 +275,67 @@ impl Settings {
                 self.blocks.push(BlockConfig::new(id));
             }
         }
+        for block in &mut self.blocks {
+            let mut seen_rows = Vec::new();
+            block.row_order.retain(|key| {
+                if key.is_empty() || seen_rows.contains(key) {
+                    false
+                } else {
+                    seen_rows.push(key.clone());
+                    true
+                }
+            });
+        }
+        for profile in &mut self.profiles {
+            profile.normalize();
+        }
+        for rule in &mut self.alert_rules {
+            rule.normalize();
+        }
     }
     pub fn block(&self, id: Block) -> Option<&BlockConfig> {
         self.blocks.iter().find(|b| b.id == id)
+    }
+    pub fn resolve_devices(&mut self, snapshot: &Snapshot) -> bool {
+        let mut changed = false;
+        for block in &mut self.blocks {
+            block.devices.retain(|name| {
+                let candidates: Vec<_> = snapshot
+                    .sections
+                    .iter()
+                    .filter(|s| s.id == block.id)
+                    .collect();
+                let mut matches: Vec<_> = candidates.iter().filter(|s| &s.device == name).collect();
+                if block.id == Block::Gpu {
+                    let base = name.split(" · ").next().unwrap_or(name);
+                    matches = candidates
+                        .iter()
+                        .filter(|s| s.device.split(" · ").next() == Some(base))
+                        .collect();
+                }
+                if matches.len() == 1 && !matches[0].device_id.starts_with("unstable:") {
+                    let id = &matches[0].device_id;
+                    if !block.device_ids.contains(id) {
+                        block.device_ids.push(id.clone());
+                    }
+                    changed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        changed
+    }
+    pub fn temperature_limits(&self, block: Block) -> Option<(f64, f64)> {
+        match block {
+            Block::Cpu => Some(self.cpu_temperature.as_ref().map_or(
+                (self.warning_temperature, self.critical_temperature),
+                |limits| (limits.warning, limits.critical),
+            )),
+            Block::Gpu => Some((self.warning_temperature, self.critical_temperature)),
+            _ => None,
+        }
     }
     pub fn load(path: &Path) -> Loaded {
         let defaults = |notice, writable| Loaded {
@@ -202,13 +354,31 @@ impl Settings {
             .ok()
             .and_then(|v| v.get("schema_version"))
             .and_then(|v| v.as_u64())
-            .is_some_and(|v| v > 1)
+            .is_some_and(|v| v > 4)
         {
             return defaults(Some("Файл создан более новой версией MH Sidebar. Сохранение отключено, исходный файл сохранён.".into()),false);
         }
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(mut settings) => {
+                let old_schema = parsed
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.get("schema_version"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 settings.normalize();
+                if old_schema < 4 {
+                    let result = backup_before_migration(path, &bytes, old_schema);
+                    if let Err(error) = result {
+                        return Loaded {
+                            settings,
+                            writable: false,
+                            notice: Some(format!(
+                                "Не удалось сохранить настройки схемы {old_schema} перед миграцией: {error}. Сохранение отключено."
+                            )),
+                        };
+                    }
+                }
                 defaults_loaded(settings)
             }
             Err(e) => {
@@ -277,6 +447,46 @@ impl Settings {
         std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+fn backup_before_migration(path: &Path, bytes: &[u8], schema: u64) -> std::io::Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..100 {
+        let suffix = if attempt == 0 {
+            format!("v{schema}.json")
+        } else {
+            format!("v{schema}-{stamp}-{attempt}.json")
+        };
+        let backup = path.with_extension(suffix);
+        match std::fs::read(&backup) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let result = file.write_all(bytes).and_then(|_| file.sync_all());
+        drop(file);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&backup);
+        }
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Не удалось выбрать имя резервной копии",
+    ))
 }
 fn finite(v: f32, default: f32) -> f32 {
     if v.is_finite() { v } else { default }

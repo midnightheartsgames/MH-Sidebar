@@ -1,4 +1,3 @@
-//! Diagnostic: step-by-step PawnIO access. Run elevated; prints each step's result.
 mod shim {
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()

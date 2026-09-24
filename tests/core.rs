@@ -1,7 +1,7 @@
 use mh_sidebar::{
     config::{BlockConfig, Settings, Side},
     history::{History, rate},
-    model::Block,
+    model::{Block, Reading},
 };
 use std::time::Duration;
 
@@ -16,6 +16,11 @@ fn temporary_dir() -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+#[test]
+fn first_run_offers_elevated_startup_by_default() {
+    assert!(Settings::default().autostart);
 }
 
 #[test]
@@ -109,4 +114,83 @@ fn counter_reset_and_zero_elapsed_do_not_invent_traffic() {
     assert_eq!(rate(300, 20, 1.), None);
     assert_eq!(rate(100, 300, 0.), None);
     assert_eq!(rate(100, 300, f64::NAN), None);
+}
+
+#[test]
+fn legacy_temperature_limits_migrate_without_changing_effective_values() {
+    let mut s: Settings =
+        serde_json::from_str(r#"{"warning_temperature":73,"critical_temperature":88}"#).unwrap();
+    s.normalize();
+    assert_eq!(s.temperature_limits(Block::Cpu), Some((73., 88.)));
+    assert_eq!(s.temperature_limits(Block::Gpu), Some((73., 88.)));
+    assert_eq!(s.temperature_limits(Block::Memory), None);
+    s.warning_temperature = 65.;
+    assert_eq!(s.temperature_limits(Block::Cpu), Some((73., 88.)));
+    assert_eq!(s.temperature_limits(Block::Gpu), Some((65., 88.)));
+}
+
+#[test]
+fn cpu_temperature_limits_are_normalized_and_roundtrip_independently() {
+    let mut s: Settings = serde_json::from_str(
+        r#"{"warning_temperature":70,"critical_temperature":90,"cpu_temperature":{"warning":200,"critical":-1}}"#,
+    ).unwrap();
+    s.normalize();
+    assert_eq!(s.temperature_limits(Block::Cpu), Some((110., 111.)));
+    assert_eq!(s.temperature_limits(Block::Gpu), Some((70., 90.)));
+    let dir = temporary_dir();
+    let path = dir.join("settings.json");
+    s.save(&path).unwrap();
+    assert_eq!(Settings::load(&path).settings, s);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn metric_order_moves_load_and_keeps_threads_together() {
+    let mut block = BlockConfig::new(Block::Cpu);
+    let keys = ["load", "clock", "core_*", "temperature", "power"]
+        .map(str::to_owned);
+    block.move_row("core_*", 0, &keys);
+    block.move_row("load", 3, &keys);
+    let rows: Vec<_> = ["load", "clock", "core_0", "core_1", "temperature", "power"]
+        .into_iter()
+        .map(|key| Reading {
+            sampled_at: None,
+            stale: false,
+            key: key.to_owned(),
+            label: key.to_owned(),
+            value: Some(1.),
+            text: "1".to_owned(),
+            unit: String::new(),
+            reason: None,
+        })
+        .collect();
+    let ordered: Vec<_> = block
+        .ordered_rows(&rows)
+        .iter()
+        .map(|row| row.key.as_str())
+        .collect();
+    assert_eq!(
+        ordered,
+        ["core_0", "core_1", "clock", "temperature", "load", "power"]
+    );
+}
+
+#[test]
+fn metric_order_survives_save_load_and_missing_devices() {
+    let dir = temporary_dir();
+    let path = dir.join("settings.json");
+    let mut settings = Settings::default();
+    let block = settings
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == Block::Gpu)
+        .unwrap();
+    block.row_order = vec!["power".into(), "temperature".into(), "load".into()];
+    block.move_row("load", 0, &["load".into(), "temperature".into()]);
+    assert!(block.row_order.contains(&"power".to_owned()));
+    let expected = block.row_order.clone();
+    settings.save(&path).unwrap();
+    let loaded = Settings::load(&path).settings;
+    assert_eq!(loaded.block(Block::Gpu).unwrap().row_order, expected);
+    std::fs::remove_dir_all(dir).unwrap();
 }

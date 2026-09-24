@@ -1,10 +1,9 @@
-# Exercises MH Sidebar's own windows only, with an isolated configuration.
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $qa = Join-Path $projectRoot 'target/gui-smoke'
 New-Item -ItemType Directory -Force -Path $qa | Out-Null
 $config = Join-Path $qa 'settings.json'
-Set-Content -LiteralPath $config -Value '{"schema_version":1,"width":360,"reserve_space":false,"autostart":false}' -Encoding utf8
+[System.IO.File]::WriteAllText($config, '{"schema_version":1,"width":360,"reserve_space":false,"autostart":false}', [System.Text.UTF8Encoding]::new($false))
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -51,26 +50,26 @@ try {
     }
     if ($settings -eq [IntPtr]::Zero) { throw 'Settings window did not open' }
     Start-Sleep -Milliseconds 800
-    [MHSmoke]::Click($settings,100,744) # Reset the draft.
+    [MHSmoke]::Click($settings,100,744)
     Start-Sleep -Milliseconds 250
-    [MHSmoke]::Click($settings,1170,808) # Cancel.
+    [MHSmoke]::Click($settings,1170,808)
     Start-Sleep -Milliseconds 1400
     if ((Get-Content -Raw -LiteralPath $config | ConvertFrom-Json).width -ne 360) { throw 'Cancel changed the saved settings' }
     if ([MHSmoke]::IsWindowVisible($settings)) { throw 'Cancel failed to close settings' }
     $sidebar = [MHSmoke]::Find($process.Id,'MH Sidebar')
     if ($sidebar -eq [IntPtr]::Zero) { throw 'Sidebar missing after Cancel' }
-    [MHSmoke]::Click($sidebar,286,33) # Settings button at width 360.
+    [MHSmoke]::Click($sidebar,286,33)
     Start-Sleep -Milliseconds 1400
     $settings = [MHSmoke]::Find($process.Id,'MH Sidebar — настройки')
     if ($settings -eq [IntPtr]::Zero) { throw 'Sidebar settings button did not reopen settings' }
     [MHSmoke]::Click($settings,100,744)
     Start-Sleep -Milliseconds 200
-    [MHSmoke]::Click($settings,1018,808) # Apply.
+    [MHSmoke]::Click($settings,1018,808)
     Start-Sleep -Milliseconds 1400
     if ((Get-Content -Raw -LiteralPath $config | ConvertFrom-Json).width -ne 280) { throw 'Apply failed to persist the draft' }
     [MHSmoke]::Click($settings,1170,808)
     Start-Sleep -Milliseconds 1200
-    [MHSmoke]::Click($sidebar,246,33) # Hide after new width 280.
+    [MHSmoke]::Click($sidebar,246,33)
     Start-Sleep -Milliseconds 1400
     if ([MHSmoke]::IsWindowVisible($sidebar)) { throw 'Hide failed' }
     Write-Output 'GUI smoke passed: settings open, Reset/Cancel, reopen, Reset/Apply, hide.'

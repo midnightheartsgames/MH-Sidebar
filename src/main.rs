@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod analytics_ui;
 mod app;
 #[cfg(debug_assertions)]
 mod capture;
 mod controls;
+mod settings_files;
 mod settings_ui;
 mod sidebar;
 mod theme;

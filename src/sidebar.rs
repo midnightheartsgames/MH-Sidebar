@@ -5,17 +5,39 @@ use mh_sidebar::{
     history::History,
     model::{Block, Reading, Snapshot},
 };
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
-pub type Histories = HashMap<String, History>;
+pub use mh_sidebar::history::Histories;
 #[derive(Default)]
 pub struct Actions {
     pub settings: bool,
     pub hide: bool,
     pub lock: bool,
+    pub detail: Option<MetricTarget>,
+}
+#[derive(Clone)]
+pub struct MetricTarget {
+    pub block: Block,
+    pub device_id: String,
+    pub metric: String,
+    pub device: String,
+    pub label: String,
+    pub unit: String,
+}
+impl MetricTarget {
+    fn new(section: &mh_sidebar::model::Section, row: &Reading) -> Self {
+        Self {
+            block: section.id,
+            device_id: section.device_id.clone(),
+            metric: row.key.clone(),
+            device: section.device.clone(),
+            label: row.label.clone(),
+            unit: row.unit.clone(),
+        }
+    }
 }
 pub fn key(block: Block, device: &str, row: &str) -> String {
-    format!("{block:?}/{device}/{row}")
+    mh_sidebar::history::metric_key(block, device, row)
 }
 
 pub fn show(
@@ -27,8 +49,6 @@ pub fn show(
     interactive: bool,
 ) -> Actions {
     let mut actions = Actions::default();
-    // Register the background hit area first so later header buttons and scroll
-    // controls remain above it in egui's hit-test order.
     let background = interactive.then(|| {
         ui.interact(
             ui.max_rect(),
@@ -37,9 +57,10 @@ pub fn show(
         )
     });
     let accent = Color32::from_rgb(settings.accent[0], settings.accent[1], settings.accent[2]);
-    ui.style_mut().spacing.item_spacing = vec2(6., 2.);
-    ui.style_mut().spacing.interact_size.y = settings.font_size + 4.;
-    ui.style_mut().spacing.button_padding = vec2(7., 2.);
+    let spacing = settings.density.spacing();
+    ui.style_mut().spacing.item_spacing = vec2(6., spacing);
+    ui.style_mut().spacing.interact_size.y = settings.font_size + spacing + 2.;
+    ui.style_mut().spacing.button_padding = vec2(7., spacing);
     ui.style_mut().text_styles.insert(
         egui::TextStyle::Body,
         egui::FontId::proportional(settings.font_size),
@@ -92,9 +113,7 @@ pub fn show(
         let sections: Vec<_> = snapshot
             .sections
             .iter()
-            .filter(|s| {
-                s.id == block.id && (block.devices.is_empty() || block.devices.contains(&s.device))
-            })
+            .filter(|s| block.selects(s))
             .collect();
         if sections.is_empty() {
             ui.label(theme::heading(block.id.short(), settings.font_size + 2.));
@@ -110,27 +129,51 @@ pub fn show(
             continue;
         }
         for section in sections {
-            // Reserve the paint slot before labels: the graph stays behind text
-            // and uses the section's measured height without adding layout space.
+            if section.disconnected {
+                ui.label(
+                    RichText::new("Отключено · сохранённая история")
+                        .small()
+                        .color(theme::WARN),
+                );
+            }
             let graph_slot = ui.painter().add(egui::Shape::Noop);
             let section_start = ui.next_widget_position();
             let section_width = ui.available_width();
-            let main = section
-                .rows
+            let ordered_rows = block.ordered_rows(&section.rows);
+            let main = ordered_rows
                 .iter()
-                .find(|r| r.key == "load" && block.shows(&r.key));
-            ui.horizontal(|ui| {
-                ui.label(theme::heading(section.id.short(), settings.font_size + 3.));
-                if let Some(main) = main {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(&main.text)
-                                .font(theme::bold(settings.font_size + 3.))
-                                .color(accent),
-                        );
-                    });
+                .copied()
+                .find(|row| {
+                    block.shows(&row.key)
+                        && (settings.show_cores || !row.key.starts_with("core_"))
+                })
+                .filter(|row| row.key == "load");
+            let headline = ui
+                .horizontal(|ui| {
+                    ui.label(theme::heading(section.id.short(), settings.font_size + 3.));
+                    if let Some(main) = main {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(&main.text)
+                                    .font(theme::bold(settings.font_size + 3.))
+                                    .color(accent),
+                            );
+                        });
+                    }
+                })
+                .response;
+            if interactive && let Some(main) = main {
+                let hit = ui
+                    .interact(
+                        headline.rect,
+                        ui.id().with((section.id, &section.device_id, "headline")),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text("Открыть график и статистику");
+                if hit.clicked() {
+                    actions.detail = Some(MetricTarget::new(section, main));
                 }
-            });
+            }
             if block.show_name {
                 ui.label(
                     RichText::new(&section.device)
@@ -138,19 +181,31 @@ pub fn show(
                         .color(theme::MUTED),
                 );
             }
-            for row in &section.rows {
-                if row.key == "load"
+            for row in ordered_rows {
+                if (row.key == "load" && main.is_some())
                     || !block.shows(&row.key)
                     || (!settings.show_cores && row.key.starts_with("core_"))
                     || (settings.hide_unavailable && row.value.is_none())
                 {
                     continue;
                 }
-                reading(ui, row, settings);
+                let response = reading(ui, row, settings, section.id);
+                if interactive {
+                    let hit = ui
+                        .interact(
+                            response.rect,
+                            ui.id().with((section.id, &section.device_id, &row.key)),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_text("Открыть график и статистику");
+                    if hit.clicked() {
+                        actions.detail = Some(MetricTarget::new(section, row));
+                    }
+                }
             }
             if block.graph
                 && let Some(row) = section.rows.iter().find(|r| r.key == block.graph_metric)
-                && let Some(history) = histories.get(&key(section.id, &section.device, &row.key))
+                && let Some(history) = histories.get(&key(section.id, &section.device_id, &row.key))
             {
                 let rect = egui::Rect::from_min_max(
                     section_start,
@@ -193,14 +248,14 @@ pub fn show(
     actions
 }
 
-fn reading(ui: &mut egui::Ui, row: &Reading, settings: &Settings) {
-    let color = if settings.alerts && row.key == "temperature" {
-        if row
-            .value
-            .is_some_and(|v| v >= settings.critical_temperature)
-        {
+fn reading(ui: &mut egui::Ui, row: &Reading, settings: &Settings, block: Block) -> egui::Response {
+    let color = if settings.alerts
+        && row.key == "temperature"
+        && let Some((warning, critical)) = settings.temperature_limits(block)
+    {
+        if row.value.is_some_and(|v| v >= critical) {
             theme::CRITICAL
-        } else if row.value.is_some_and(|v| v >= settings.warning_temperature) {
+        } else if row.value.is_some_and(|v| v >= warning) {
             theme::WARN
         } else {
             theme::TEXT
@@ -212,7 +267,10 @@ fn reading(ui: &mut egui::Ui, row: &Reading, settings: &Settings) {
         .horizontal(|ui| {
             let available = ui.available_width();
             ui.allocate_ui_with_layout(
-                vec2(available * 0.54, settings.font_size + 2.),
+                vec2(
+                    available * 0.54,
+                    settings.font_size + settings.density.spacing(),
+                ),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.add(
@@ -227,9 +285,9 @@ fn reading(ui: &mut egui::Ui, row: &Reading, settings: &Settings) {
         })
         .response;
     if let Some(reason) = &row.reason {
-        response.on_hover_text(reason);
+        response.on_hover_text(reason)
     } else {
-        response.on_hover_text(&row.label);
+        response.on_hover_text(&row.label)
     }
 }
 

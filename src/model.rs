@@ -1,4 +1,52 @@
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Source {
+    Cpu,
+    CpuDriver,
+    Memory,
+    Gpu,
+    Disks,
+    Network,
+}
+impl Source {
+    pub const ALL: [Self; 6] = [
+        Self::Cpu,
+        Self::CpuDriver,
+        Self::Memory,
+        Self::Gpu,
+        Self::Disks,
+        Self::Network,
+    ];
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU / ОС",
+            Self::CpuDriver => "CPU / PawnIO",
+            Self::Memory => "Память",
+            Self::Gpu => "GPU",
+            Self::Disks => "Диски",
+            Self::Network => "Сеть",
+        }
+    }
+    pub fn block(self) -> Block {
+        match self {
+            Self::Cpu | Self::CpuDriver => Block::Cpu,
+            Self::Memory => Block::Memory,
+            Self::Gpu => Block::Gpu,
+            Self::Disks => Block::Disks,
+            Self::Network => Block::Network,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceStatus {
+    pub source: Source,
+    pub age: Option<Duration>,
+    pub stale: bool,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Block {
@@ -43,25 +91,48 @@ impl Block {
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
+    pub sources: Vec<SourceStatus>,
     pub sections: Vec<Section>,
-    /// State of the PawnIO driver that provides CPU temperature and power.
     pub cpu_driver: DriverStatus,
+    pub cpu_diagnostic: String,
 }
-
-/// Why CPU temperature and power are (un)available; the settings UI offers a fix for each case.
+impl Snapshot {
+    pub fn merge(&mut self, other: Snapshot) {
+        if !other.cpu_diagnostic.is_empty() {
+            self.cpu_driver = other.cpu_driver;
+            self.cpu_diagnostic = other.cpu_diagnostic;
+        }
+        self.sources.extend(other.sources);
+        for section in other.sections {
+            if let Some(existing) = self
+                .sections
+                .iter_mut()
+                .find(|s| s.id == section.id && s.device_id == section.device_id)
+            {
+                if section.device != "Процессор" {
+                    existing.device = section.device;
+                }
+                existing.rows.extend(section.rows);
+            } else {
+                self.sections.push(section);
+            }
+        }
+        self.sections.sort_by(|a, b| {
+            let order = |b| Block::ALL.iter().position(|v| *v == b).unwrap_or(0);
+            order(a.id)
+                .cmp(&order(b.id))
+                .then(a.device_id.cmp(&b.device_id))
+        });
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DriverStatus {
-    /// Not probed yet.
     #[default]
     Unknown,
     Ready,
-    /// The PawnIO driver is not installed.
     NotInstalled,
-    /// The driver is installed but can only be opened by an elevated process.
     NeedsAdmin,
-    /// No PawnIO module for this CPU.
     Unsupported,
-    /// The driver rejected the module or the request.
     Failed,
 }
 
@@ -80,14 +151,16 @@ impl DriverStatus {
 
 #[derive(Debug, Clone)]
 pub struct Section {
+    pub disconnected: bool,
     pub id: Block,
+    pub device_id: String,
     pub device: String,
     pub rows: Vec<Reading>,
 }
-
-/// Numeric values carry explicit units; unsupported readings are None with a reason.
 #[derive(Debug, Clone)]
 pub struct Reading {
+    pub sampled_at: Option<Instant>,
+    pub stale: bool,
     pub key: String,
     pub label: String,
     pub value: Option<f64>,
@@ -100,6 +173,8 @@ impl Reading {
     pub fn number(key: &str, label: &str, value: Option<f64>, unit: &str) -> Self {
         let value = value.filter(|v| v.is_finite());
         Self {
+            sampled_at: None,
+            stale: false,
             key: key.into(),
             label: label.into(),
             value,
@@ -112,6 +187,8 @@ impl Reading {
     }
     pub fn unavailable(key: &str, label: &str, reason: &str) -> Self {
         Self {
+            sampled_at: None,
+            stale: false,
             key: key.into(),
             label: label.into(),
             value: None,

@@ -1,10 +1,12 @@
-//! Opt-in integration probe. Briefly reserves desktop space, then restores it.
 use mh_sidebar::{
     config::{Settings, Side},
     platform::{self, DockWindow},
 };
 use std::{ptr::null_mut, time::Duration};
-use windows_sys::Win32::{System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*};
+use windows_sys::Win32::{
+    System::LibraryLoader::GetModuleHandleW,
+    UI::{HiDpi::*, WindowsAndMessaging::*},
+};
 fn pause() {
     unsafe {
         let mut msg = std::mem::zeroed();
@@ -19,6 +21,7 @@ fn pause() {
 }
 fn main() {
     unsafe {
+        assert!(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0);
         let class: Vec<u16> = "MHSidebarDockProbe".encode_utf16().chain(Some(0)).collect();
         let module = GetModuleHandleW(std::ptr::null());
         let wc = WNDCLASSW {
@@ -44,7 +47,12 @@ fn main() {
         );
         assert!(!hwnd.is_null());
         let before = platform::monitors();
-        let monitor = platform::choose_monitor(&before, "").unwrap().clone();
+        let monitor = if std::env::args().any(|arg| arg == "--primary") {
+            before.iter().find(|monitor| monitor.primary).unwrap()
+        } else {
+            platform::choose_monitor(&before, "").unwrap()
+        }
+        .clone();
         let mut settings = Settings {
             monitor_id: monitor.id.clone(),
             reserve_space: true,

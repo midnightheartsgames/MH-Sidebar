@@ -1,12 +1,3 @@
-//! Трей и глобальные хоткеи. Оба присылают команды в один канал.
-//!
-//! **Живут в своём потоке** со своим циклом сообщений. В потоке winit модальное меню трея
-//! (`TrackPopupMenu`) подвешивало цикл событий: HUD замирал, а «Настройки» и «Выход» ждали
-//! первого движения мыши над оверлеем (PLAN.md §2.16).
-//!
-//! Обработчики событий будят UI: пока панель скрыт, eframe не рисует кадры, и без пробуждения
-//! команду «показать» было бы некому выполнить.
-
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
@@ -18,9 +9,35 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
 use mh_sidebar::config::Hotkeys as HotkeySettings;
-
-/// Как часто поток трея проверяет просьбы UI, если сообщений нет.
 const TRAY_TICK_MS: u32 = 50;
+const TRAY_GUID: u128 = 0x17712bbb_fdfc_4623_bf33_5c0aaee90ddd;
+
+fn show_notification(title: &str, message: &str) {
+    use windows_sys::Win32::UI::Shell::{
+        NIF_GUID, NIF_INFO, NIIF_WARNING, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    };
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        uFlags: NIF_GUID | NIF_INFO,
+        dwInfoFlags: NIIF_WARNING,
+        guidItem: windows_sys::core::GUID::from_u128(TRAY_GUID),
+        ..Default::default()
+    };
+    for (slot, ch) in data
+        .szInfoTitle
+        .iter_mut()
+        .take(63)
+        .zip(title.encode_utf16())
+    {
+        *slot = ch;
+    }
+    for (slot, ch) in data.szInfo.iter_mut().take(255).zip(message.encode_utf16()) {
+        *slot = ch;
+    }
+    unsafe {
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
 
 fn pump_messages(wait_ms: u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -48,12 +65,12 @@ pub enum Command {
     RestartSensors,
     Exit,
 }
-
-/// Просьбы UI к потоку трея.
 enum Request {
     Menu { visible: bool, locked: bool },
     Tooltip(String),
+    Notify { title: String, message: String },
     Hotkeys(HotkeySettings),
+    SuspendHotkeys(Sender<()>),
     Quit,
 }
 
@@ -61,7 +78,6 @@ pub struct Controls {
     pub commands: Receiver<Command>,
     requests: Sender<Request>,
     thread: Option<JoinHandle<()>>,
-    /// Хоткеи, которые не удалось зарегистрировать, — для подсказки пользователю.
     pub hotkey_errors: Vec<String>,
     errors: Receiver<Vec<String>>,
 }
@@ -78,7 +94,6 @@ impl Controls {
             .name("mh-tray".into())
             .spawn(move || tray_thread(&ctx, &hotkeys, &sender, &inbox, &ready))
             .ok();
-        // Ошибки хоткеев нужны HUD сразу. Поток отвечает, как только всё создано.
         let hotkey_errors = if thread.is_some() {
             started
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -94,19 +109,27 @@ impl Controls {
             errors: started,
         }
     }
-
-    /// Подписи пунктов меню следуют состоянию панели.
     pub fn sync_menu(&self, visible: bool, locked: bool) {
         let _ = self.requests.send(Request::Menu { visible, locked });
     }
-
-    /// Подсказка значка в трее — единственное, что видно поверх эксклюзивного полноэкранного
-    /// режима.
     pub fn set_tooltip(&self, text: &str) {
         let _ = self.requests.send(Request::Tooltip(text.to_string()));
     }
+    pub fn notify(&self, title: &str, message: &str) {
+        let _ = self.requests.send(Request::Notify {
+            title: title.to_owned(),
+            message: message.to_owned(),
+        });
+    }
     pub fn update_hotkeys(&self, settings: &HotkeySettings) {
         let _ = self.requests.send(Request::Hotkeys(settings.clone()));
+    }
+    pub fn suspend_hotkeys(&self) -> bool {
+        let (ready, wait) = channel();
+        self.requests.send(Request::SuspendHotkeys(ready)).is_ok()
+            && wait
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok()
     }
     pub fn poll_errors(&mut self) -> bool {
         let mut changed = false;
@@ -126,9 +149,6 @@ impl Drop for Controls {
         }
     }
 }
-
-/// Всё, что создаёт скрытые окна, — здесь: окна принадлежат потоку, в котором созданы, и
-/// уничтожаться должны в нём же.
 fn tray_thread(
     ctx: &egui::Context,
     hotkeys: &HotkeySettings,
@@ -177,8 +197,6 @@ fn tray_thread(
         };
         send(&menu_sender, &menu_ctx, command);
     }));
-
-    // Левый клик по значку — показать или скрыть; меню — по правому.
     let tray_sender = sender.clone();
     let tray_ctx = ctx.clone();
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
@@ -193,6 +211,7 @@ fn tray_thread(
     }));
 
     let tray = TrayIconBuilder::new()
+        .with_guid(TRAY_GUID)
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .with_tooltip("MH Sidebar")
@@ -237,7 +256,20 @@ fn tray_thread(
                         let _ = tray.set_tooltip(Some(text));
                     }
                 }
+                Request::Notify { title, message } => {
+                    if tray.is_some() {
+                        show_notification(&title, &message);
+                    }
+                }
                 Request::Quit => quit = true,
+                Request::SuspendHotkeys(ready) => {
+                    if let Some(manager) = &manager {
+                        for (key, _) in bindings.drain(..) {
+                            let _ = manager.unregister(key);
+                        }
+                    }
+                    let _ = ready.send(());
+                }
                 Request::Hotkeys(settings) => {
                     let mut errors = register_hotkeys(manager.as_ref(), &mut bindings, &settings);
                     if tray.is_none() {
@@ -252,14 +284,12 @@ fn tray_thread(
             break;
         }
     }
-    // Значок и хоткеи снимаются здесь, в своём потоке.
     drop(tray);
     drop(manager);
 }
 
 fn send(sender: &Sender<Command>, ctx: &egui::Context, command: Command) {
     let _ = sender.send(command);
-    // Будим именно корневое окно: команды разбираются в его `logic`.
     ctx.request_repaint_of(egui::ViewportId::ROOT);
 }
 
@@ -287,7 +317,6 @@ fn register_hotkeys(
         match parse_hotkey(text) {
             Some(hotkey) => match manager.register(hotkey) {
                 Ok(()) => bindings.push((hotkey, command)),
-                // Обычно — занят другой программой.
                 Err(_) => errors.push(format!("хоткей {text} занят другой программой")),
             },
             None => errors.push(format!("хоткей «{text}» не разобран")),
@@ -295,17 +324,13 @@ fn register_hotkeys(
     }
     errors
 }
-
-/// «Ctrl+Shift+F11» → [`HotKey`]. Разбор global-hotkey понимает «ctrl», «shift», «alt».
 pub fn parse_hotkey(text: &str) -> Option<HotKey> {
     text.parse().ok()
 }
-
-/// Значок трея: три столбика акцентного цвета, как у старого `TrayIconPainter`.
 fn tray_icon() -> Icon {
     const SIZE: u32 = 32;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let bars = [(4, 18), (13, 8), (22, 13)]; // (x, верх столбика)
+    let bars = [(4, 18), (13, 8), (22, 13)];
     for (left, top) in bars {
         for y in top..28 {
             for x in left..left + 6 {
@@ -397,5 +422,29 @@ mod tests {
                 Command::ToggleVisible
             );
         }
+        assert!(controls.suspend_hotkeys());
+        post(&settings.visibility);
+        assert!(
+            controls
+                .commands
+                .recv_timeout(Duration::from_millis(120))
+                .is_err()
+        );
+        controls.update_hotkeys(&settings);
+        assert!(
+            controls
+                .errors
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_empty()
+        );
+        post(&settings.visibility);
+        assert_eq!(
+            controls
+                .commands
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Command::ToggleVisible
+        );
     }
 }

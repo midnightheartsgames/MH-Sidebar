@@ -3,7 +3,10 @@ fn main() {
     for sample in 0..3 {
         println!("Sample {sample}");
         for section in sampler.sample().sections {
-            println!("{:?}: {}", section.id, section.device);
+            println!(
+                "{:?}: {} [{}]",
+                section.id, section.device, section.device_id
+            );
             for row in section.rows {
                 println!("  {} = {} {:?}", row.key, row.text, row.reason);
             }

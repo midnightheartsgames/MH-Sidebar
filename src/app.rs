@@ -1,4 +1,5 @@
 use crate::{
+    analytics_ui::{AnalyticsView, AnalyticsWindow},
     controls::{Command, Controls},
     settings_ui::{DriverAction, SettingsWindow},
     sidebar::{self, Histories},
@@ -6,6 +7,8 @@ use crate::{
 };
 use eframe::egui::{self, ViewportCommand, ViewportId};
 use mh_sidebar::{
+    alerts::AlertEngine,
+    collection::Collector,
     config::{self, Settings},
     model::Snapshot,
     platform::{self, DockWindow, Monitor},
@@ -13,67 +16,8 @@ use mh_sidebar::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Sender},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
-
-enum WorkerRequest {
-    Interval(u64),
-    Restart,
-    Stop,
-}
-struct Worker {
-    latest: Arc<Mutex<Option<(Instant, Snapshot)>>>,
-    sender: Sender<WorkerRequest>,
-    thread: Option<JoinHandle<()>>,
-}
-impl Worker {
-    fn start(ctx: &egui::Context, interval: u64) -> Result<Self, String> {
-        let latest = Arc::new(Mutex::new(None));
-        let output = latest.clone();
-        let ctx = ctx.clone();
-        let (sender, rx) = mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name("mh-sensors".into())
-            .spawn(move || {
-                let mut sampler = mh_sidebar::sensors::Sampler::new();
-                let mut interval = interval;
-                loop {
-                    let snapshot = sampler.sample();
-                    if let Ok(mut slot) = output.lock() {
-                        *slot = Some((Instant::now(), snapshot));
-                    }
-                    ctx.request_repaint_of(ViewportId::ROOT);
-                    match rx.recv_timeout(Duration::from_millis(interval)) {
-                        Ok(WorkerRequest::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            break;
-                        }
-                        Ok(WorkerRequest::Interval(ms)) => interval = ms,
-                        Ok(WorkerRequest::Restart) => sampler = mh_sidebar::sensors::Sampler::new(),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())?;
-        Ok(Self {
-            latest,
-            sender,
-            thread: Some(thread),
-        })
-    }
-}
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let _ = self.sender.send(WorkerRequest::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
 
 pub fn run() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
@@ -94,7 +38,20 @@ pub fn run() -> eframe::Result {
     let first = !path.exists();
     let loaded = Settings::load(&path);
     let settings = loaded.settings;
-    let open = first || args.iter().any(|s| s == "--settings");
+    let mut open = first || args.iter().any(|s| s == "--settings");
+    let startup_notice = if settings.autostart && platform::legacy_autostart_exists() {
+        match platform::set_autostart(true) {
+            Ok(()) => {
+                Some("Автозапуск перенесён в Планировщик задач с правами администратора".into())
+            }
+            Err(e) => {
+                open = true;
+                Some(format!("Автозапуск пока без прав администратора: {e}"))
+            }
+        }
+    } else {
+        None
+    };
     let smoke = args
         .iter()
         .position(|s| s == "--smoke-test")
@@ -121,16 +78,18 @@ pub fn run() -> eframe::Result {
         Box::new(move |cc| {
             theme::setup(&cc.egui_ctx);
             let window = cc.window_handle().ok().and_then(|h| match h.as_raw() {
-                // The eframe root window is live and belongs to this GUI thread.
                 RawWindowHandle::Win32(h) => Some(unsafe { DockWindow::new(h.hwnd.get() as _) }),
                 _ => None,
             });
             let mut settings_window = SettingsWindow::new(&settings, first);
             settings_window.open = open;
-            settings_window.status = loaded.notice;
+            settings_window.status = startup_notice.or(loaded.notice);
             let controls = Controls::install(&cc.egui_ctx, &settings.hotkeys);
-            let worker =
-                Worker::start(&cc.egui_ctx, settings.interval_ms).map_err(std::io::Error::other)?;
+            let wake_context = cc.egui_ctx.clone();
+            let worker = Collector::start(settings.interval_ms, move || {
+                wake_context.request_repaint_of(ViewportId::ROOT)
+            })
+            .map_err(std::io::Error::other)?;
             let mut app = App {
                 settings,
                 settings_window,
@@ -142,13 +101,17 @@ pub fn run() -> eframe::Result {
                 monitors: platform::monitors(),
                 next_monitors: Instant::now(),
                 snapshot: Snapshot::default(),
-                histories: Histories::new(),
+                histories: Histories::default(),
                 start: Instant::now(),
-                last_sample: None,
-                stale: false,
+                start_wall: SystemTime::now(),
+                analytics_window: AnalyticsWindow::default(),
+                alert_engine: AlertEngine::default(),
+                #[cfg(debug_assertions)]
+                analytics_qa_opened: false,
                 exiting: false,
                 smoke,
                 last_viewport: None,
+                hotkeys_suspended: false,
             };
             app.control_errors();
             app.sync(&cc.egui_ctx);
@@ -157,24 +120,36 @@ pub fn run() -> eframe::Result {
     )
 }
 
+fn autostart_needs_update(previous: bool, next: bool, first_run: bool, legacy: bool) -> bool {
+    if first_run {
+        next || legacy
+    } else {
+        previous != next || (next && legacy)
+    }
+}
+
 struct App {
     settings: Settings,
     settings_window: SettingsWindow,
     path: PathBuf,
     writable: bool,
     controls: Option<Controls>,
-    worker: Option<Worker>,
+    worker: Option<Collector>,
     window: Option<DockWindow>,
     monitors: Vec<Monitor>,
     next_monitors: Instant,
     snapshot: Snapshot,
     histories: Histories,
     start: Instant,
-    last_sample: Option<Instant>,
-    stale: bool,
+    start_wall: SystemTime,
+    analytics_window: AnalyticsWindow,
+    alert_engine: AlertEngine,
+    #[cfg(debug_assertions)]
+    analytics_qa_opened: bool,
     exiting: bool,
     smoke: Option<u64>,
     last_viewport: Option<(bool, bool)>,
+    hotkeys_suspended: bool,
 }
 impl App {
     fn control_errors(&mut self) {
@@ -196,10 +171,11 @@ impl App {
             Command::ToggleLock => self.settings.locked = !self.settings.locked,
             Command::OpenSettings => self.settings_window.open(&self.settings),
             Command::RestartSensors => {
-                if let Some(w) = &self.worker {
-                    let _ = w.sender.send(WorkerRequest::Restart);
+                if let Some(w) = &mut self.worker {
+                    w.restart();
                 }
                 self.histories.clear();
+                self.alert_engine.clear();
             }
             Command::Exit => self.exiting = true,
         }
@@ -262,26 +238,39 @@ impl App {
             keys.push(parsed.id());
         }
         let startup_changed = next.autostart != self.settings.autostart;
-        if startup_changed && let Err(e) = platform::set_autostart(next.autostart) {
+        let startup_needs_update = autostart_needs_update(
+            self.settings.autostart,
+            next.autostart,
+            self.settings_window.first_run,
+            platform::legacy_autostart_exists(),
+        );
+        if startup_needs_update && let Err(e) = platform::set_autostart(next.autostart) {
             self.settings_window.status = Some(format!("Автозапуск: {e}"));
             return;
         }
         if let Err(e) = next.save(&self.path) {
-            if startup_changed {
-                let _ = platform::set_autostart(self.settings.autostart);
+            if startup_needs_update && (startup_changed || self.settings_window.first_run) {
+                let rollback = self.settings.autostart && !self.settings_window.first_run;
+                let _ = platform::set_autostart(rollback);
             }
             self.settings_window.status = Some(format!("Не удалось сохранить настройки: {e}"));
             return;
         }
         let changed_keys = next.hotkeys != self.settings.hotkeys;
+        if next.alert_rules != self.settings.alert_rules
+            || next.notifications_enabled != self.settings.notifications_enabled
+        {
+            self.alert_engine.clear();
+        }
         self.settings = next;
-        if let Some(w) = &self.worker {
-            let _ = w
-                .sender
-                .send(WorkerRequest::Interval(self.settings.interval_ms));
+        if let Some(w) = &mut self.worker {
+            w.set_interval(self.settings.interval_ms);
         }
         self.settings_window.status = Some("Настройки сохранены".into());
-        if changed_keys && let Some(controls) = &self.controls {
+        if changed_keys
+            && !self.hotkeys_suspended
+            && let Some(controls) = &self.controls
+        {
             controls.update_hotkeys(&self.settings.hotkeys);
         }
         self.control_errors();
@@ -295,7 +284,6 @@ impl App {
         effective.visible = self.settings.visible || self.settings_window.open;
         effective.reserve_space = self.settings.reserve_space && self.settings.visible;
         effective.locked = self.settings.locked || !self.settings.visible;
-        // Keep the invisible root alive while its independent settings viewport is open.
         let state = (effective.visible, effective.locked);
         if self.last_viewport != Some(state) {
             ctx.send_viewport_cmd(ViewportCommand::Visible(effective.visible));
@@ -312,58 +300,87 @@ impl App {
         }
     }
     fn sample(&mut self) {
-        let latest = self
-            .worker
-            .as_ref()
-            .and_then(|w| w.latest.lock().ok()?.take());
-        if let Some((at, snapshot)) = latest {
-            let now = at.duration_since(self.start).as_secs_f64();
-            let mut active = std::collections::HashSet::new();
-            for section in &snapshot.sections {
-                for row in &section.rows {
-                    let key = sidebar::key(section.id, &section.device, &row.key);
-                    active.insert(key.clone());
-                    self.histories.entry(key).or_default().push(now, row.value);
+        let now = Instant::now();
+        let Some(worker) = &mut self.worker else {
+            return;
+        };
+        self.snapshot = worker.snapshot(now);
+        if self.settings.notifications_enabled {
+            for alert in self
+                .alert_engine
+                .observe(&self.snapshot, &self.settings.alert_rules, now)
+            {
+                if let Some(c) = &self.controls {
+                    c.notify(
+                        "MH Sidebar — предупреждение",
+                        &format!(
+                            "{} · {} · {}: {:.1} {} (порог {:.1})",
+                            alert.block.title(),
+                            alert.device,
+                            alert.label,
+                            alert.value,
+                            alert.unit,
+                            alert.threshold
+                        ),
+                    );
                 }
             }
-            self.histories.retain(|k, _| active.contains(k));
-            self.snapshot = snapshot;
-            self.last_sample = Some(at);
-            self.stale = false;
-            if let Some(c) = &self.controls {
-                let loads = self
-                    .snapshot
-                    .sections
-                    .iter()
-                    .filter_map(|s| {
-                        s.rows
-                            .iter()
-                            .find(|r| r.key == "load")
-                            .map(|r| format!("{} {}", s.id.short(), r.text))
-                    })
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                c.set_tooltip(&format!("MH Sidebar\n{loads}"));
-            }
+        } else {
+            self.alert_engine.clear();
         }
-        if !self.stale
-            && self.last_sample.is_some_and(|at| {
-                at.elapsed() > Duration::from_millis((self.settings.interval_ms * 3).max(5000))
-            })
+        self.histories.observe(
+            &self.snapshot,
+            now,
+            self.start,
+            Duration::from_secs(self.settings.graph_seconds),
+        );
+        #[cfg(debug_assertions)]
+        if !self.analytics_qa_opened
+            && std::env::var_os("MH_SIDEBAR_ANALYTICS_QA").is_some()
+            && let Some(section) = self
+                .snapshot
+                .sections
+                .iter()
+                .find(|s| s.rows.iter().any(|r| r.key == "load"))
+            && let Some(row) = section.rows.iter().find(|r| r.key == "load")
         {
-            for section in &mut self.snapshot.sections {
-                for row in &mut section.rows {
-                    row.value = None;
-                    row.text = "—".into();
-                    row.reason = Some("Данные устарели: ожидание датчика".into());
-                }
-            }
-            let now = self.start.elapsed().as_secs_f64();
-            for h in self.histories.values_mut() {
-                h.push(now, None);
-            }
-            self.stale = true;
+            self.analytics_window.open(crate::sidebar::MetricTarget {
+                block: section.id,
+                device_id: section.device_id.clone(),
+                metric: row.key.clone(),
+                device: section.device.clone(),
+                label: row.label.clone(),
+                unit: row.unit.clone(),
+            });
+            self.analytics_qa_opened = true;
+        }
+        let migrated = self.settings.resolve_devices(&self.snapshot);
+        if self.settings_window.open {
+            self.settings_window.draft.resolve_devices(&self.snapshot);
+        }
+        if migrated {
+            self.persist();
+        }
+        let retained = self.histories.missing_sections(&self.snapshot);
+        self.snapshot.merge(Snapshot {
+            sections: retained,
+            ..Default::default()
+        });
+        if let Some(c) = &self.controls {
+            let loads = self
+                .snapshot
+                .sections
+                .iter()
+                .filter_map(|s| {
+                    s.rows
+                        .iter()
+                        .find(|r| r.key == "load")
+                        .map(|r| format!("{} {}", s.id.short(), r.text))
+                })
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            c.set_tooltip(&format!("MH Sidebar\n{loads}"));
         }
     }
 }
@@ -442,23 +459,63 @@ impl eframe::App for App {
                             if actions.lock {
                                 self.command(Command::ToggleLock);
                             }
+                            if let Some(target) = actions.detail {
+                                self.analytics_window.open(target);
+                            }
                         });
                 });
         }
-        if let Some(next) =
-            self.settings_window
-                .show(&ctx, &self.snapshot, &self.histories, now, &self.monitors)
-        {
+        if let Some(next) = self.settings_window.show(
+            &ctx,
+            &self.snapshot,
+            &self.histories,
+            now,
+            &self.monitors,
+            &self.path,
+        ) {
             self.apply(next);
+        }
+        self.analytics_window.show(
+            &ctx,
+            AnalyticsView {
+                snapshot: &self.snapshot,
+                histories: &self.histories,
+                now,
+                seconds: self.settings.graph_seconds,
+                origin: self.start_wall,
+                active_path: &self.path,
+            },
+        );
+        let recording = self.settings_window.open && self.settings_window.recording.is_some();
+        if recording != self.hotkeys_suspended {
+            if let Some(controls) = &self.controls {
+                if recording {
+                    if !controls.suspend_hotkeys() {
+                        self.settings_window.recording = None;
+                        self.settings_window.status =
+                            Some("Не удалось начать запись клавиш. Попробуйте ещё раз.".into());
+                        controls.update_hotkeys(&self.settings.hotkeys);
+                    } else {
+                        self.hotkeys_suspended = true;
+                    }
+                } else {
+                    controls.update_hotkeys(&self.settings.hotkeys);
+                    self.hotkeys_suspended = false;
+                }
+            } else {
+                self.settings_window.recording = None;
+            }
         }
         if let Some(action) = self.settings_window.action.take() {
             self.driver_action(action);
         }
         #[cfg(debug_assertions)]
-        if self.settings_window.open
-            && let Some(gl) = _frame.gl()
-        {
-            crate::capture::immediate(&ctx, gl, now);
+        if let Some(gl) = _frame.gl() {
+            if self.analytics_window.is_open() {
+                crate::capture::immediate(&ctx, gl, now, "analytics");
+            } else if self.settings_window.open {
+                crate::capture::immediate(&ctx, gl, now, "settings");
+            }
         }
         self.sync(&ctx);
         #[cfg(debug_assertions)]
@@ -488,5 +545,17 @@ fn icon() -> egui::IconData {
         rgba,
         width: 32,
         height: 32,
+    }
+}
+
+#[cfg(test)]
+mod autostart_tests {
+    use super::*;
+
+    #[test]
+    fn first_run_opt_out_never_requests_elevation_without_an_old_entry() {
+        assert!(!autostart_needs_update(true, false, true, false));
+        assert!(autostart_needs_update(true, true, true, false));
+        assert!(autostart_needs_update(true, false, true, true));
     }
 }

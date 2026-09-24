@@ -51,11 +51,69 @@ fn dock_rect(bounds: ScreenRect, logical_width: f32, scale: f32, side: Side) -> 
 
 fn requested_rect(monitor: &Monitor, settings: &Settings) -> ScreenRect {
     let mut bounds = monitor.rect;
-    // Keep the physical monitor edge, without overlapping a top/bottom taskbar.
-    // The shell does not trim side AppBars against the taskbar, so do it for both modes.
     bounds.top = monitor.work.top.max(bounds.top);
     bounds.bottom = monitor.work.bottom.min(bounds.bottom);
     dock_rect(bounds, settings.width, monitor.scale, settings.side)
+}
+
+#[cfg(windows)]
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn autostart_script(enabled: bool, user: &str, exe: &str) -> String {
+    let clear_legacy = "if (Test-Path $runPath) { $legacy = Get-ItemProperty -Path $runPath; if ($legacy.PSObject.Properties['MH-Sidebar']) { Remove-ItemProperty -Path $runPath -Name 'MH-Sidebar' } }";
+    let mut script = format!(
+        "$ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); if ($identity.Name -ne {}) {{ throw 'Повышение выполнено для другой учётной записи' }}; if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ throw 'Требуются права администратора' }}; $taskName = 'MH Sidebar ' + $identity.User.Value; $runPath = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'; ",
+        powershell_literal(user)
+    );
+    if enabled {
+        let directory = std::path::Path::new(exe)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        script.push_str(&format!(
+            "$action = New-ScheduledTaskAction -Execute {} -WorkingDirectory {}; $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name; $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Highest; $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $taskPrincipal -Settings $settings -Force | Out-Null; ",
+            powershell_literal(exe),
+            powershell_literal(&directory)
+        ));
+        script.push_str("try { ");
+        script.push_str(clear_legacy);
+        script.push_str(
+            " } catch { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false; throw }",
+        );
+    } else {
+        script.push_str(clear_legacy);
+        script.push_str("; ");
+        script.push_str("$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; if ($task) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false }; ");
+    }
+    script
+}
+
+#[cfg(windows)]
+fn encode_powershell(script: &str) -> String {
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let bits = ((group[0] as u32) << 16)
+            | ((group.get(1).copied().unwrap_or(0) as u32) << 8)
+            | group.get(2).copied().unwrap_or(0) as u32;
+        encoded.push(alphabet[((bits >> 18) & 63) as usize] as char);
+        encoded.push(alphabet[((bits >> 12) & 63) as usize] as char);
+        encoded.push(if group.len() > 1 {
+            alphabet[((bits >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if group.len() > 2 {
+            alphabet[(bits & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 #[cfg(windows)]
@@ -108,7 +166,6 @@ mod native {
             _: *mut RECT,
             data: LPARAM,
         ) -> i32 {
-            // Windows invokes this synchronously with the Vec pointer passed below.
             unsafe {
                 let mut info: MONITORINFOEXW = std::mem::zeroed();
                 info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
@@ -117,7 +174,6 @@ mod native {
                 }
                 let mut device: DISPLAY_DEVICEW = std::mem::zeroed();
                 device.cb = size_of::<DISPLAY_DEVICEW>() as u32;
-                // EDD_GET_DEVICE_INTERFACE_NAME returns the persistent monitor interface identity.
                 let found = EnumDisplayDevicesW(info.szDevice.as_ptr(), 0, &mut device, 1) != 0;
                 let id = if found {
                     string(&device.DeviceID)
@@ -198,7 +254,6 @@ mod native {
             DefSubclassProc(hwnd, msg, w, l)
         }
     }
-    /// Owns a GUI-thread-only subclass and the shell's registration of the real window.
     pub struct DockWindow {
         hwnd: HWND,
         state: Box<CallbackState>,
@@ -209,9 +264,7 @@ mod native {
         _gui_thread: PhantomData<Rc<()>>,
     }
     impl DockWindow {
-        /// # Safety
-        /// `hwnd` must be a live window owned by this thread. The returned wrapper
-        /// must be dropped on this same thread before its owner is released.
+        #[expect(clippy::missing_safety_doc)]
         pub unsafe fn new(hwnd: HWND) -> Self {
             let state = Box::new(CallbackState {
                 dirty: Cell::new(true),
@@ -309,7 +362,6 @@ mod native {
                 if settings.reserve_space {
                     let destination = (monitor.id.clone(), settings.side);
                     if self.registration_target.as_ref() != Some(&destination) {
-                        // Release the previous monitor/edge before negotiating the new one.
                         self.remove();
                     }
                     if !self.registered {
@@ -393,7 +445,6 @@ mod native {
                 None
             };
             if self.state.dirty.get() {
-                // A display event may precede the UI's cached monitor list refresh.
                 self.apply(settings, &monitors())
             } else if desired != self.last {
                 self.apply(settings, list)
@@ -413,58 +464,81 @@ mod native {
             }
         }
     }
-    pub fn set_autostart(enabled: bool) -> Result<(), String> {
-        // This function is only called after an explicit setting change, never by tests.
-        let value = wide("MH-Sidebar");
-        let path = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    pub fn legacy_autostart_exists() -> bool {
         let mut key = null_mut();
         unsafe {
-            let status = RegCreateKeyExW(
+            if RegOpenKeyExW(
                 HKEY_CURRENT_USER,
-                path.as_ptr(),
+                wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run").as_ptr(),
                 0,
-                null(),
-                0,
-                KEY_SET_VALUE,
-                null(),
+                KEY_QUERY_VALUE,
                 &mut key,
-                null_mut(),
-            );
-            if status != ERROR_SUCCESS {
-                return Err(format!("Open per-user startup key: {status}"));
+            ) != ERROR_SUCCESS
+            {
+                return false;
             }
-            let result = if enabled {
-                match std::env::current_exe() {
-                    Ok(exe) => {
-                        let command: Vec<u16> = Some('"' as u16)
-                            .into_iter()
-                            .chain(exe.as_os_str().encode_wide())
-                            .chain(['"' as u16, 0])
-                            .collect();
-                        RegSetValueExW(
-                            key,
-                            value.as_ptr(),
-                            0,
-                            REG_SZ,
-                            command.as_ptr().cast(),
-                            (command.len() * 2) as u32,
-                        )
-                    }
-                    Err(e) => {
-                        RegCloseKey(key);
-                        return Err(format!("Find application executable: {e}"));
-                    }
-                }
-            } else {
-                RegDeleteValueW(key, value.as_ptr())
-            };
+            let mut length = 0;
+            let status = RegQueryValueExW(
+                key,
+                wide("MH-Sidebar").as_ptr(),
+                null(),
+                null_mut(),
+                null_mut(),
+                &mut length,
+            );
             RegCloseKey(key);
-            if result == ERROR_SUCCESS || (!enabled && result == ERROR_FILE_NOT_FOUND) {
-                Ok(())
-            } else {
-                Err(format!("Change per-user startup entry: {result}"))
+            status == ERROR_SUCCESS
+        }
+    }
+
+    pub fn set_autostart(enabled: bool) -> Result<(), String> {
+        let domain = std::env::var("USERDOMAIN").map_err(|e| e.to_string())?;
+        let name = std::env::var("USERNAME").map_err(|e| e.to_string())?;
+        let user = format!("{domain}\\{name}");
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let script = super::autostart_script(enabled, &user, &exe.to_string_lossy());
+        let arguments = wide(&format!(
+            "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {}",
+            super::encode_powershell(&script)
+        ));
+        let system_root = std::env::var_os("SystemRoot").ok_or("Не найден каталог Windows")?;
+        let powershell = std::path::PathBuf::from(system_root)
+            .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        let file: Vec<u16> = powershell
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut execution = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: null(),
+            lpFile: file.as_ptr(),
+            lpParameters: arguments.as_ptr(),
+            nShow: SW_HIDE,
+            ..Default::default()
+        };
+        let verb = wide("runas");
+        execution.lpVerb = verb.as_ptr();
+        unsafe {
+            if ShellExecuteExW(&mut execution) == 0 {
+                return Err(error("Подтверждение UAC для автозапуска"));
+            }
+            if execution.hProcess.is_null() {
+                return Err("Планировщик не вернул результат настройки автозапуска".into());
+            }
+            let wait = WaitForSingleObject(execution.hProcess, INFINITE);
+            let mut code = 1;
+            let read_code = GetExitCodeProcess(execution.hProcess, &mut code);
+            CloseHandle(execution.hProcess);
+            if wait != WAIT_OBJECT_0 || read_code == 0 {
+                return Err(error("Ожидание настройки автозапуска"));
+            }
+            if code != 0 {
+                return Err("не удалось создать задачу Windows. Проверьте права администратора и службу Планировщика задач".into());
             }
         }
+        Ok(())
     }
     pub struct SingleInstance(HANDLE);
     impl SingleInstance {
@@ -491,7 +565,6 @@ mod native {
         }
     }
     impl SingleInstance {
-        /// Used after an elevated relaunch: the previous instance is still shutting down.
         pub fn acquire_waiting(timeout: std::time::Duration) -> Option<Self> {
             let deadline = std::time::Instant::now() + timeout;
             loop {
@@ -505,8 +578,6 @@ mod native {
             }
         }
     }
-
-    /// True when this process runs with an administrator token.
     pub fn is_elevated() -> bool {
         use windows_sys::Win32::Security::{
             GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -540,15 +611,12 @@ mod native {
                 SW_SHOWNORMAL,
             )
         };
-        // ShellExecuteW reports success as a value greater than 32.
         if result as isize > 32 {
             Ok(())
         } else {
             Err(error(file))
         }
     }
-    /// Starts a new elevated copy with the same arguments and the settings window open.
-    /// The caller must exit so the new copy can take the single-instance lock.
     pub fn relaunch_elevated() -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut arguments: Vec<String> = std::env::args()
@@ -563,7 +631,6 @@ mod native {
             .join(" ");
         shell_execute("runas", &exe.to_string_lossy(), &parameters)
     }
-    /// Installs the PawnIO driver with winget in a visible console; winget asks for UAC itself.
     pub fn install_pawnio() -> Result<(), String> {
         shell_execute(
             "open",
@@ -644,7 +711,6 @@ mod tests {
             right: 0,
             bottom: 0,
         };
-        // A horizontal inset may be our own previous reservation; do not reuse it.
         display.work = ScreenRect {
             left: -1600,
             top: -1040,
@@ -680,5 +746,52 @@ mod tests {
                 bottom: -48
             }
         );
+    }
+
+    #[test]
+    fn elevated_autostart_uses_interactive_logon_and_escapes_exe_path() {
+        let script = autostart_script(true, "DESKTOP\\Alice", "C:\\O'Brien & Sons\\MH-Sidebar.exe");
+        assert!(script.contains("-AtLogOn -User $identity.Name"));
+        assert!(script.contains("-LogonType Interactive -RunLevel Highest"));
+        assert!(script.contains("C:\\O''Brien & Sons\\MH-Sidebar.exe"));
+        assert!(script.contains("Remove-ItemProperty"));
+        assert!(!script.contains("HKLM:"));
+    }
+
+    #[test]
+    fn disabled_autostart_removes_task_and_legacy_entry() {
+        let script = autostart_script(false, "DESKTOP\\Alice", "C:\\MH-Sidebar.exe");
+        assert!(script.contains("Unregister-ScheduledTask"));
+        assert!(script.contains("Remove-ItemProperty"));
+        assert!(!script.contains("Register-ScheduledTask"));
+        assert!(script.find("Remove-ItemProperty") < script.find("Unregister-ScheduledTask"));
+    }
+
+    #[test]
+    fn migration_rolls_back_a_new_task_if_legacy_cleanup_fails() {
+        let script = autostart_script(true, "DESKTOP\\Alice", "C:\\MH-Sidebar.exe");
+        assert!(script.contains("catch { Unregister-ScheduledTask"));
+    }
+
+    #[test]
+    fn powershell_argument_uses_utf16le_base64() {
+        assert_eq!(encode_powershell("A"), "QQA=");
+        assert_eq!(encode_powershell("AB"), "QQBCAA==");
+    }
+
+    #[test]
+    fn generated_autostart_scripts_parse_in_windows_powershell() {
+        for enabled in [true, false] {
+            let script = autostart_script(enabled, "DESKTOP\\Alice", "C:\\O'Brien\\MH-Sidebar.exe");
+            let check = format!(
+                "[scriptblock]::Create({}) | Out-Null",
+                powershell_literal(&script)
+            );
+            let status = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &check])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
     }
 }
