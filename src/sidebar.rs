@@ -144,8 +144,7 @@ pub fn show(
                 .iter()
                 .copied()
                 .find(|row| {
-                    block.shows(&row.key)
-                        && (settings.show_cores || !row.key.starts_with("core_"))
+                    block.shows(&row.key) && (settings.show_cores || !row.key.starts_with("core_"))
                 })
                 .filter(|row| row.key == "load");
             let headline = ui

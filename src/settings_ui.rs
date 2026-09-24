@@ -468,23 +468,17 @@ impl SettingsWindow {
                                 block.set_row(key, checked);
                             }
                         }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .add_enabled(index + 1 < rows.len(), egui::Button::new("↓"))
-                                    .clicked()
-                                {
-                                    movement = Some((key.clone(), index + 1));
-                                }
-                                if ui
-                                    .add_enabled(index > 0, egui::Button::new("↑"))
-                                    .clicked()
-                                {
-                                    movement = Some((key.clone(), index - 1));
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(index + 1 < rows.len(), egui::Button::new("↓"))
+                                .clicked()
+                            {
+                                movement = Some((key.clone(), index + 1));
+                            }
+                            if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                                movement = Some((key.clone(), index - 1));
+                            }
+                        });
                     });
                     if row.response.dnd_hover_payload::<String>().is_some() {
                         ui.painter().hline(

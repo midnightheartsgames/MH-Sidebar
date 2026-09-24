@@ -147,8 +147,7 @@ fn cpu_temperature_limits_are_normalized_and_roundtrip_independently() {
 #[test]
 fn metric_order_moves_load_and_keeps_threads_together() {
     let mut block = BlockConfig::new(Block::Cpu);
-    let keys = ["load", "clock", "core_*", "temperature", "power"]
-        .map(str::to_owned);
+    let keys = ["load", "clock", "core_*", "temperature", "power"].map(str::to_owned);
     block.move_row("core_*", 0, &keys);
     block.move_row("load", 3, &keys);
     let rows: Vec<_> = ["load", "clock", "core_0", "core_1", "temperature", "power"]
