@@ -13,6 +13,7 @@ use mh_sidebar::{
     model::Snapshot,
     platform::{self, DockWindow, Monitor},
 };
+#[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     path::PathBuf,
@@ -39,19 +40,20 @@ pub fn run() -> eframe::Result {
     let loaded = Settings::load(&path);
     let settings = loaded.settings;
     let mut open = first || args.iter().any(|s| s == "--settings");
-    let startup_notice = if settings.autostart && platform::legacy_autostart_exists() {
-        match platform::set_autostart(true) {
-            Ok(()) => {
-                Some("Автозапуск перенесён в Планировщик задач с правами администратора".into())
+    let startup_notice =
+        if cfg!(windows) && settings.autostart && platform::legacy_autostart_exists() {
+            match platform::set_autostart(true) {
+                Ok(()) => {
+                    Some("Автозапуск перенесён в Планировщик задач с правами администратора".into())
+                }
+                Err(e) => {
+                    open = true;
+                    Some(format!("Автозапуск пока без прав администратора: {e}"))
+                }
             }
-            Err(e) => {
-                open = true;
-                Some(format!("Автозапуск пока без прав администратора: {e}"))
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let smoke = args
         .iter()
         .position(|s| s == "--smoke-test")
@@ -77,10 +79,13 @@ pub fn run() -> eframe::Result {
         options,
         Box::new(move |cc| {
             theme::setup(&cc.egui_ctx);
+            #[cfg(windows)]
             let window = cc.window_handle().ok().and_then(|h| match h.as_raw() {
                 RawWindowHandle::Win32(h) => Some(unsafe { DockWindow::new(h.hwnd.get() as _) }),
                 _ => None,
             });
+            #[cfg(not(windows))]
+            let window = Some(DockWindow::new(cc.egui_ctx.clone()));
             let mut settings_window = SettingsWindow::new(&settings, first);
             settings_window.open = open;
             settings_window.status = startup_notice.or(loaded.notice);
@@ -98,7 +103,7 @@ pub fn run() -> eframe::Result {
                 controls: Some(controls),
                 worker: Some(worker),
                 window,
-                monitors: platform::monitors(),
+                monitors: current_monitors(&cc.egui_ctx),
                 next_monitors: Instant::now(),
                 snapshot: Snapshot::default(),
                 histories: Histories::default(),
@@ -118,6 +123,41 @@ pub fn run() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(windows)]
+fn current_monitors(_: &egui::Context) -> Vec<Monitor> {
+    platform::monitors()
+}
+
+#[cfg(not(windows))]
+fn current_monitors(context: &egui::Context) -> Vec<Monitor> {
+    let found = platform::monitors();
+    if !found.is_empty() {
+        return found;
+    }
+    context
+        .input(|input| input.viewport().monitor_size)
+        .map_or_else(Vec::new, |size| {
+            vec![Monitor {
+                id: "current".into(),
+                name: "Текущий экран".into(),
+                rect: platform::ScreenRect {
+                    left: 0,
+                    top: 0,
+                    right: size.x as i32,
+                    bottom: size.y as i32,
+                },
+                work: platform::ScreenRect {
+                    left: 0,
+                    top: 0,
+                    right: size.x as i32,
+                    bottom: size.y as i32,
+                },
+                scale: 1.0,
+                primary: true,
+            }]
+        })
 }
 
 fn autostart_needs_update(previous: bool, next: bool, first_run: bool, legacy: bool) -> bool {
@@ -269,7 +309,7 @@ impl App {
         self.settings_window.status = Some("Настройки сохранены".into());
         if changed_keys
             && !self.hotkeys_suspended
-            && let Some(controls) = &self.controls
+            && let Some(controls) = &mut self.controls
         {
             controls.update_hotkeys(&self.settings.hotkeys);
         }
@@ -411,7 +451,7 @@ impl eframe::App for App {
             self.settings.visible = false;
         }
         if Instant::now() >= self.next_monitors {
-            self.monitors = platform::monitors();
+            self.monitors = current_monitors(ctx);
             self.next_monitors = Instant::now() + Duration::from_secs(3);
         }
         self.sample();
@@ -488,7 +528,7 @@ impl eframe::App for App {
         );
         let recording = self.settings_window.open && self.settings_window.recording.is_some();
         if recording != self.hotkeys_suspended {
-            if let Some(controls) = &self.controls {
+            if let Some(controls) = &mut self.controls {
                 if recording {
                     if !controls.suspend_hotkeys() {
                         self.settings_window.recording = None;

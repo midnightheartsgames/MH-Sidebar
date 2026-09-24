@@ -1,12 +1,12 @@
 # MH Sidebar
 
-MH Sidebar показывает загрузку CPU и GPU, память, диски и сеть в боковой панели Windows 10/11 x64. Приложение написано на Rust и запускается без установки. В интерфейсе используются шрифт Cuprum, тёмные карточки и оформление MH Monitoring.
+MH Sidebar показывает загрузку CPU и GPU, память, диски и сеть в боковой панели Windows 10/11 x64, Linux и macOS. Приложение написано на Rust и запускается без установки. В интерфейсе используются шрифт Cuprum, тёмные карточки и оформление MH Monitoring.
 
 ![Панель MH Sidebar](docs/screenshots/sidebar.png)
 
-## Первый запуск
+## Первый запуск в Windows
 
-1. Распакуйте `MH-Sidebar-v0.5.1-windows-x64.zip` или возьмите `MH-Sidebar.exe` из `dist/v0.5.1/`.
+1. Распакуйте `MH-Sidebar-v0.5.2-windows-x64.zip` или возьмите `MH-Sidebar.exe` из `dist/v0.5.2/`.
 2. Запустите EXE. В открывшихся настройках выберите монитор, сторону и ширину панели, затем нажмите **Готово**. Если монитор один, приложение использует его; при двух по умолчанию выбирается второй.
 3. Если нужен автозапуск с доступом к датчикам PawnIO, подтвердите запрос Windows на повышение прав. Автозапуск включён в начальных настройках. При отказе настройки останутся открытыми, а задача автозапуска не создастся.
 
@@ -49,7 +49,7 @@ MH Sidebar работает с AMD Ryzen Zen 1–5 и процессорами I
 
 Раздел **Профили** содержит минимальный, игровой и рабочий варианты. Можно сохранять и удалять собственные. Профиль меняет оформление, часы, блоки и выбор устройств. Монитор, автозапуск, видимость, сочетания клавиш и температурные пороги остаются текущими. Импорт JSON меняет черновик до нажатия **Применить**; экспорт сохраняет текущий черновик. Файлы импорта ограничены 1 МиБ.
 
-Файл настроек находится по пути `%APPDATA%/MH Sidebar/settings.json`. Перед переносом старой схемы приложение сохраняет её исходный JSON как `settings.v1.json`, `settings.v2.json` или `settings.v3.json`; уже существующая копия не затирается. Повреждённый файл сохраняется под именем `settings.corrupted-<timestamp>.json`. Настройки более новой схемы приложение не перезаписывает.
+Файл настроек находится по пути `%APPDATA%/MH Sidebar/settings.json` в Windows, `$XDG_CONFIG_HOME/mh-sidebar/settings.json` (или `~/.config/mh-sidebar/settings.json`) в Linux и `~/Library/Application Support/MH Sidebar/settings.json` в macOS. Перед переносом старой схемы приложение сохраняет её исходный JSON как `settings.v1.json`, `settings.v2.json` или `settings.v3.json`; уже существующая копия не затирается. Повреждённый файл сохраняется под именем `settings.corrupted-<timestamp>.json`. Настройки более новой схемы приложение не перезаписывает.
 
 Опция **Зарезервировать пространство** не даёт развёрнутым окнам занимать место панели. По умолчанию она выключена. Если панель задач Windows расположена сбоку и перекрывает MH Sidebar, включите резервирование.
 
@@ -79,17 +79,43 @@ CPU, PawnIO, RAM, GPU, диски и сеть опрашиваются неза�
 
 ## Сборка из исходников
 
-Нужны Windows x64, стабильный Rust с MSVC toolchain, Windows SDK и Visual Studio Build Tools с C++.
+Для Windows нужны x64, стабильный Rust с MSVC toolchain, Windows SDK и Visual Studio Build Tools с C++.
 
 ```powershell
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File tools/build-release.ps1
-powershell -ExecutionPolicy Bypass -File tools/verify-release.ps1 -PackageDirectory dist/v0.5.1 -ExpectedVersion 0.5.1
+powershell -ExecutionPolicy Bypass -File tools/verify-release.ps1 -PackageDirectory dist/v0.5.2 -ExpectedVersion 0.5.2
 ```
 
-Скрипт выпуска берёт версию из `Cargo.toml`, создаёт `dist/v0.5.1/` и ZIP, проверяет состав пакета, SHA-256 файлов и архитектуру EXE. Если каталог версии уже существует, сборка остановится, не заменяя прежний пакет. CI выполняет форматирование, тесты, Clippy и сборку на Windows; аппаратные сценарии и поведение UAC требуют проверки на целевой машине.
+Скрипт выпуска берёт версию из `Cargo.toml`, создаёт `dist/v0.5.2/` и ZIP, проверяет состав пакета, SHA-256 файлов и архитектуру EXE. Если каталог версии уже существует, сборка остановится, не заменяя прежний пакет. CI выполняет форматирование, тесты, Clippy и сборку на Windows; аппаратные сценарии и поведение UAC требуют проверки на целевой машине.
+
+### Linux и macOS
+
+Для Linux нужен стабильный Rust, компилятор C и библиотеки GTK 3, AppIndicator, X11/Xdo и OpenGL. На Ubuntu установите их командой:
+
+```sh
+sudo apt-get install libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev libgl1-mesa-dev zenity libnotify-bin x11-xserver-utils
+cargo build --locked --release --bin MH-Sidebar
+./target/release/MH-Sidebar
+```
+
+Для macOS нужны стабильный Rust и Xcode Command Line Tools:
+
+```sh
+xcode-select --install
+cargo build --locked --release --bin MH-Sidebar
+./target/release/MH-Sidebar
+```
+
+В CI macOS также создаётся архив с `MH Sidebar.app`. Приложение пока не подписано сертификатом Apple.
+
+В [GitHub Releases](https://github.com/midnightheartsgames/MH-Sidebar/releases) публикуются архивы для Windows x64, Linux x64, macOS Apple Silicon и macOS Intel. У каждого архива есть файл `.sha256` для проверки загрузки. Релиз появляется после успешной сборки и тестов на всех четырёх платформах.
+
+В Linux автозапуск настраивается через XDG Autostart, в macOS — через LaunchAgent текущего пользователя. Linux-диалоги импорта и экспорта используют `zenity` или `kdialog`, уведомления — `notify-send`; macOS использует системные диалоги и уведомления. Значок в системном трее нужен, чтобы вернуть скрытую панель. Если его не удалось создать, приложение оставляет панель видимой и открывает настройки.
+
+Сейчас Linux/macOS используют `sysinfo` для CPU, памяти, дисков и сети, NVML для NVIDIA GPU и доступный системный датчик температуры CPU. Мощность CPU и показатели GPU без NVML могут отсутствовать. Резервирование места на рабочем столе работает только в Windows. Linux получает геометрию экранов через `xrandr` в X11; в Wayland выбор нескольких экранов и точное закрепление панели зависят от композитора и ещё не подтверждены. macOS получает геометрию через Core Graphics; панель пока может перекрывать строку меню или Dock. CI собирает Linux и macOS на соответствующих системах; ручной запуск на этих ОС ещё нужно проверить.
 
 Для диагностики доступны примеры `probe`, `pawnio_probe`, `collection_probe`, `compatibility_probe` и `dock_probe` в каталоге `examples/`. `dock_probe` кратковременно резервирует рабочую область и должен запускаться в обычном сеансе Explorer. Скрипты `tools/gui-smoke.ps1` и `tools/measure-resources.ps1` проверяют интерфейс и потребление ресурсов с отдельным конфигом. Тестовый запуск приложения также принимает `--config "C:/path/settings.json" --settings` и `--smoke-test 15`.
 

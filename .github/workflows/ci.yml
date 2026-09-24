@@ -1,23 +1,97 @@
-name: Windows Rust
+name: Rust platforms
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
   verify:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: windows-x64
+          - os: ubuntu-latest
+            suffix: linux-x64
+          - os: macos-latest
+            suffix: macos-arm64
+          - os: macos-15-intel
+            suffix: macos-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain
-        run: rustup update stable; rustup default stable; rustup component add rustfmt clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev libgl1-mesa-dev
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build portable release
+        if: runner.os == 'Windows'
         shell: pwsh
         run: ./tools/build-release.ps1
-      - uses: actions/upload-artifact@v4
+      - name: Build Unix release
+        if: runner.os != 'Windows'
+        run: cargo build --locked --release --bin MH-Sidebar
+      - name: Package Linux archive
+        if: runner.os == 'Linux'
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "mh-sidebar"))')
+          mkdir -p dist/package
+          cp target/release/MH-Sidebar README.md LICENSE THIRD-PARTY.md dist/package/
+          cp assets/fonts/OFL.txt dist/package/Cuprum-OFL.txt
+          archive="MH-Sidebar-v${version}-linux-x64.tar.gz"
+          tar -czf "dist/$archive" -C dist/package .
+          cd dist
+          sha256sum "$archive" > "$archive.sha256"
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "dist/MH Sidebar.app/Contents/MacOS" "dist/MH Sidebar.app/Contents/Resources"
+          cp target/release/MH-Sidebar "dist/MH Sidebar.app/Contents/MacOS/MH-Sidebar"
+          cp README.md LICENSE THIRD-PARTY.md "dist/MH Sidebar.app/Contents/Resources/"
+          cp assets/fonts/OFL.txt "dist/MH Sidebar.app/Contents/Resources/Cuprum-OFL.txt"
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "mh-sidebar"))')
+          sed "s/{version}/$version/g" assets/mac/Info.plist > "dist/MH Sidebar.app/Contents/Info.plist"
+          archive="MH-Sidebar-v${version}-${{ matrix.suffix }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/MH Sidebar.app" "dist/$archive"
+          cd dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
         with:
-          name: MH-Sidebar-windows-x64
-          path: |
-            dist/MH-Sidebar-v*-windows-x64.zip
-            dist/MH-Sidebar-v*-windows-x64.zip.sha256
+          name: MH-Sidebar-${{ matrix.suffix }}
+          path: dist/MH-Sidebar-v*-${{ matrix.suffix }}*
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "mh-sidebar"))')
+          test "v$version" = "$GITHUB_REF_NAME"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: MH-Sidebar-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release files
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
+          for checksums in *.sha256; do sha256sum -c "$checksums"; done
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MH Sidebar ${{ github.ref_name }}
+          body_path: docs/releases/v0.5.2.md
+          files: dist/MH-Sidebar-v*
+          fail_on_unmatched_files: true

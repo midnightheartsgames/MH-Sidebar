@@ -296,21 +296,46 @@ fn separator(ui: &mut egui::Ui) {
     ui.add_space(3.);
 }
 fn clock(ui: &mut egui::Ui, settings: &Settings, accent: Color32) {
-    use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
-    let mut time: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut time) };
+    #[cfg(windows)]
+    let (hour, minute, second, day, month, year) = {
+        use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
+        let mut time: SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut time) };
+        (
+            time.wHour as i32,
+            time.wMinute as i32,
+            time.wSecond as i32,
+            time.wDay as i32,
+            time.wMonth as usize,
+            time.wYear as i32,
+        )
+    };
+    #[cfg(not(windows))]
+    let (hour, minute, second, day, month, year) = {
+        let mut seconds = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&mut seconds, &mut local) };
+        (
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+            local.tm_mday,
+            (local.tm_mon + 1) as usize,
+            local.tm_year + 1900,
+        )
+    };
     let hour = if settings.clock_24h {
-        time.wHour
+        hour
     } else {
-        let h = time.wHour % 12;
+        let h = hour % 12;
         if h == 0 { 12 } else { h }
     };
-    let mut text = format!("{hour:02}:{:02}", time.wMinute);
+    let mut text = format!("{hour:02}:{minute:02}");
     if settings.show_seconds {
-        text.push_str(&format!(":{:02}", time.wSecond));
+        text.push_str(&format!(":{second:02}"));
     }
     if !settings.clock_24h {
-        text.push_str(if time.wHour >= 12 { " PM" } else { " AM" });
+        text.push_str(if hour >= 12 { " PM" } else { " AM" });
     }
     ui.label(RichText::new(text).font(theme::bold(32.)).color(accent));
     if settings.show_date {
@@ -331,9 +356,9 @@ fn clock(ui: &mut egui::Ui, settings: &Settings, accent: Color32) {
         ui.label(
             RichText::new(format!(
                 "{} {} {}",
-                time.wDay,
-                months[(time.wMonth.saturating_sub(1) as usize).min(11)],
-                time.wYear
+                day,
+                months[month.saturating_sub(1).min(11)],
+                year
             ))
             .color(theme::MUTED),
         );

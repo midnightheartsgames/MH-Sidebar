@@ -645,6 +645,12 @@ mod native {
 #[cfg(windows)]
 pub use native::*;
 
+#[cfg(not(windows))]
+#[path = "platform_portable.rs"]
+mod portable;
+#[cfg(not(windows))]
+pub use portable::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +754,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn elevated_autostart_uses_interactive_logon_and_escapes_exe_path() {
         let script = autostart_script(true, "DESKTOP\\Alice", "C:\\O'Brien & Sons\\MH-Sidebar.exe");
@@ -758,6 +765,7 @@ mod tests {
         assert!(!script.contains("HKLM:"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn disabled_autostart_removes_task_and_legacy_entry() {
         let script = autostart_script(false, "DESKTOP\\Alice", "C:\\MH-Sidebar.exe");
@@ -767,18 +775,21 @@ mod tests {
         assert!(script.find("Remove-ItemProperty") < script.find("Unregister-ScheduledTask"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn migration_rolls_back_a_new_task_if_legacy_cleanup_fails() {
         let script = autostart_script(true, "DESKTOP\\Alice", "C:\\MH-Sidebar.exe");
         assert!(script.contains("catch { Unregister-ScheduledTask"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn powershell_argument_uses_utf16le_base64() {
         assert_eq!(encode_powershell("A"), "QQA=");
         assert_eq!(encode_powershell("AB"), "QQBCAA==");
     }
 
+    #[cfg(windows)]
     #[test]
     fn generated_autostart_scripts_parse_in_windows_powershell() {
         for enabled in [true, false] {

@@ -1,3 +1,4 @@
+#[cfg(windows)]
 mod shim {
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()
@@ -5,8 +6,10 @@ mod shim {
     #[path = "../../src/sensors/pawnio.rs"]
     pub mod pawnio;
 }
+#[cfg(windows)]
 use shim::pawnio::{PawnIo, PciAccessLock};
 
+#[cfg(windows)]
 fn main() {
     let module = include_bytes!("../assets/pawnio/AMDFamily17.bin");
     let pawnio = match PawnIo::open_with_module(module) {
@@ -32,4 +35,9 @@ fn main() {
         Ok(lock) => println!("pci lock: {:?}", lock.with(50, || ())),
         Err(e) => println!("pci lock: {e:?}"),
     }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("Этот пример предназначен для Windows");
 }

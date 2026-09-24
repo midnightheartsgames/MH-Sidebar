@@ -1,4 +1,10 @@
+#[cfg(windows)]
 use std::path::PathBuf;
+
+#[cfg(not(windows))]
+fn main() {}
+
+#[cfg(windows)]
 fn main() {
     println!("cargo:rerun-if-changed=assets/app.manifest");
     println!("cargo:rerun-if-changed=build.rs");

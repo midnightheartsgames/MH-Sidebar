@@ -1551,12 +1551,15 @@ dependencies = [
 
 [[package]]
 name = "mh-sidebar"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
+ "core-graphics",
  "eframe",
  "embed-resource",
  "global-hotkey",
+ "gtk",
  "image",
+ "libc",
  "nvml-wrapper",
  "raw-window-handle",
  "serde",

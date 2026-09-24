@@ -1,12 +1,16 @@
+#[cfg(windows)]
 use mh_sidebar::{
     config::{Settings, Side},
     platform::{self, DockWindow},
 };
+#[cfg(windows)]
 use std::{ptr::null_mut, time::Duration};
+#[cfg(windows)]
 use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{HiDpi::*, WindowsAndMessaging::*},
 };
+#[cfg(windows)]
 fn pause() {
     unsafe {
         let mut msg = std::mem::zeroed();
@@ -19,6 +23,7 @@ fn pause() {
         }
     }
 }
+#[cfg(windows)]
 fn main() {
     unsafe {
         assert!(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0);
@@ -105,4 +110,9 @@ fn main() {
         UnregisterClassW(class.as_ptr(), module);
         println!("AppBar right/left/hide/show/drop checks passed");
     }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("Этот пример предназначен для Windows");
 }

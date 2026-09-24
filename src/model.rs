@@ -22,7 +22,13 @@ impl Source {
     pub fn title(self) -> &'static str {
         match self {
             Self::Cpu => "CPU / ОС",
-            Self::CpuDriver => "CPU / PawnIO",
+            Self::CpuDriver => {
+                if cfg!(windows) {
+                    "CPU / PawnIO"
+                } else {
+                    "CPU / датчик"
+                }
+            }
             Self::Memory => "Память",
             Self::Gpu => "GPU",
             Self::Disks => "Диски",

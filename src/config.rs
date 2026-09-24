@@ -230,11 +230,27 @@ pub struct Loaded {
 }
 
 pub fn default_path() -> PathBuf {
-    std::env::var_os("APPDATA")
+    #[cfg(windows)]
+    let root = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("MH Sidebar")
-        .join("settings.json")
+        .join("MH Sidebar");
+    #[cfg(target_os = "linux")]
+    let root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".config")
+        })
+        .join("mh-sidebar");
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library/Application Support/MH Sidebar");
+    root.join("settings.json")
 }
 
 impl Settings {

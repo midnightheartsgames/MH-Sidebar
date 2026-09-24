@@ -1,6 +1,6 @@
 [package]
 name = "mh-sidebar"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -15,14 +15,26 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-sysinfo = { version = "0.39", default-features = false, features = ["system", "disk", "network"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk", "network", "component"] }
 nvml-wrapper = "0.13"
-tray-icon = "0.25"
 global-hotkey = "0.8"
 raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.25"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Wdk_Graphics_Direct3D"] }
 
-[build-dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = "0.25"
+libc = "0.2"
+gtk = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.25", default-features = false }
+core-graphics = "0.23"
+libc = "0.2"
+
+[target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
 
 [profile.release]

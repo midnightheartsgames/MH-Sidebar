@@ -3,9 +3,11 @@ use crate::{
     theme,
 };
 use eframe::egui::{self, Color32, RichText, vec2};
+#[cfg(windows)]
+use mh_sidebar::model::DriverStatus;
 use mh_sidebar::{
     config::{Density, Preset, Settings, Side},
-    model::{Block, DriverStatus, Snapshot},
+    model::{Block, Snapshot},
     platform::Monitor,
 };
 
@@ -253,30 +255,39 @@ impl SettingsWindow {
     fn general(&mut self, ui: &mut egui::Ui, monitors: &[Monitor]) {
         if self.first_run {
             theme::card(ui, "Добро пожаловать", |ui| {
+                #[cfg(windows)]
                 ui.label("Выберите монитор и сторону панели. Автозапуск с правами администратора включён по умолчанию; при нажатии «Готово» Windows запросит подтверждение UAC. Справа показаны реальные показатели.");
+                #[cfg(not(windows))]
+                ui.label("Выберите экран и сторону панели. Автозапуск включён по умолчанию. Справа показаны доступные системные показатели.");
             });
         }
         let s = &mut self.draft;
         theme::card(ui, "Основные параметры", |ui| {
             theme::toggle(ui, "Показывать панель", &mut s.visible);
             theme::toggle(ui, "Поверх всех окон", &mut s.always_on_top);
-            theme::toggle(ui, "Зарезервировать пространство", &mut s.reserve_space);
-            ui.label(
-                RichText::new("При резервировании развёрнутые окна оставляют место для панели.")
+            #[cfg(windows)]
+            {
+                theme::toggle(ui, "Зарезервировать пространство", &mut s.reserve_space);
+                ui.label(
+                    RichText::new(
+                        "При резервировании развёрнутые окна оставляют место для панели.",
+                    )
                     .small()
                     .color(theme::MUTED),
-            );
+                );
+            }
             theme::toggle(ui, "Пропускать клики сквозь панель", &mut s.locked);
-            theme::toggle(
-                ui,
-                "Запускать от администратора при входе в Windows",
-                &mut s.autostart,
-            );
-            ui.label(
-                RichText::new("При включении Windows один раз запросит подтверждение UAC. Затем программа запускается с повышенными правами без повторного запроса.")
-                    .small()
-                    .color(theme::MUTED),
-            );
+            #[cfg(windows)]
+            {
+                theme::toggle(
+                    ui,
+                    "Запускать от администратора при входе в Windows",
+                    &mut s.autostart,
+                );
+                ui.label(RichText::new("При включении Windows один раз запросит подтверждение UAC. Затем программа запускается с повышенными правами без повторного запроса.").small().color(theme::MUTED));
+            }
+            #[cfg(not(windows))]
+            theme::toggle(ui, "Запускать при входе в систему", &mut s.autostart);
             theme::row(ui, "Интервал обновления", |ui| {
                 egui::ComboBox::from_id_salt("interval")
                     .selected_text(format!("{} мс", s.interval_ms))
@@ -629,10 +640,12 @@ impl SettingsWindow {
                         .small()
                         .color(theme::MUTED),
                 );
+                #[cfg(windows)]
                 self.driver(ui, snapshot.cpu_driver);
             }
         });
     }
+    #[cfg(windows)]
     fn driver(&mut self, ui: &mut egui::Ui, status: DriverStatus) {
         let text = match status {
             DriverStatus::Unknown | DriverStatus::Ready => return,
@@ -991,11 +1004,15 @@ impl SettingsWindow {
                     self.recording = None;
                     break;
                 }
-                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-                    GetKeyState, VK_LWIN, VK_RWIN,
+                #[cfg(windows)]
+                let win = {
+                    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                        GetKeyState, VK_LWIN, VK_RWIN,
+                    };
+                    unsafe { GetKeyState(VK_LWIN as i32) < 0 || GetKeyState(VK_RWIN as i32) < 0 }
                 };
-                let win =
-                    unsafe { GetKeyState(VK_LWIN as i32) < 0 || GetKeyState(VK_RWIN as i32) < 0 };
+                #[cfg(not(windows))]
+                let win = modifiers.mac_cmd || modifiers.command && !modifiers.ctrl;
                 if let Some(text) = recorded_hotkey(physical_key.unwrap_or(key), modifiers, win) {
                     let value = match index {
                         0 => &mut self.draft.hotkeys.visibility,
