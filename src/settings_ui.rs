@@ -456,6 +456,21 @@ impl SettingsWindow {
                         }
                     });
             });
+            if mh_sidebar::processes::supports(id) {
+                theme::row(ui, "Топ приложений", |ui| {
+                    let title = |count: usize| match count {
+                        0 => "Выключен".to_owned(),
+                        count => format!("Топ-{count}"),
+                    };
+                    egui::ComboBox::from_id_salt("top-apps")
+                        .selected_text(title(block.top_apps))
+                        .show_ui(ui, |ui| {
+                            for count in mh_sidebar::processes::COUNTS {
+                                ui.selectable_value(&mut block.top_apps, count, title(count));
+                            }
+                        });
+                });
+            }
             ui.add_space(8.);
             ui.label(
                 RichText::new("Порядок показателей: перетащите за ≡ или используйте стрелки.")

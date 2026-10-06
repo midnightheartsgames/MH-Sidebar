@@ -28,6 +28,7 @@ pub struct BlockConfig {
     pub row_order: Vec<String>,
     pub devices: Vec<String>,
     pub device_ids: Vec<String>,
+    pub top_apps: usize,
 }
 impl Default for BlockConfig {
     fn default() -> Self {
@@ -50,6 +51,15 @@ impl BlockConfig {
             row_order: Vec::new(),
             devices: Vec::new(),
             device_ids: Vec::new(),
+            top_apps: if crate::processes::supports(id) { 3 } else { 0 },
+        }
+    }
+    /// Размер списка самых нагруженных приложений, который действительно показывается.
+    pub fn top_apps(&self) -> usize {
+        if self.enabled && crate::processes::supports(self.id) {
+            self.top_apps
+        } else {
+            0
         }
     }
     pub fn shows(&self, key: &str) -> bool {
@@ -292,6 +302,11 @@ impl Settings {
             }
         }
         for block in &mut self.blocks {
+            block.top_apps = if crate::processes::supports(block.id) {
+                crate::processes::normalize_count(block.top_apps)
+            } else {
+                0
+            };
             let mut seen_rows = Vec::new();
             block.row_order.retain(|key| {
                 if key.is_empty() || seen_rows.contains(key) {

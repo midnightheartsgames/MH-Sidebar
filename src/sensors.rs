@@ -45,7 +45,10 @@ mod tests {
     }
 }
 
-use crate::model::{Block, Reading, Section, Snapshot, Source};
+use crate::{
+    model::{Block, Reading, Section, Snapshot, Source},
+    processes::{self, Processes},
+};
 use nvml_wrapper::{
     Nvml,
     enum_wrappers::device::{Clock, TemperatureSensor},
@@ -100,6 +103,10 @@ pub struct Sampler {
     gpu_ready: bool,
     disk_ready: bool,
     cpu_sensor: recovery::CpuRecovery<cpu_temp::CpuSensor>,
+    processes: Processes,
+    gpu_seen: HashMap<String, u64>,
+    /// Сколько самых нагруженных приложений собирать для CPU, GPU и ОЗУ; 0 отключает обход процессов.
+    pub top_apps: usize,
 }
 impl Default for Sampler {
     fn default() -> Self {
@@ -124,6 +131,9 @@ impl Sampler {
             gpu_ready: false,
             disk_ready: false,
             cpu_sensor: recovery::CpuRecovery::default(),
+            processes: Processes::default(),
+            gpu_seen: HashMap::new(),
+            top_apps: 0,
         }
     }
     fn refresh_due(&mut self, source: Source) -> bool {
@@ -217,6 +227,10 @@ impl Sampler {
                 device: name,
                 rows: cpu,
             }],
+            top_apps: (self.top_apps > 0)
+                .then(|| self.processes.cpu("cpu:system", self.top_apps))
+                .into_iter()
+                .collect(),
             ..Default::default()
         }
     }
@@ -275,6 +289,10 @@ impl Sampler {
                     row("total", "Всего", Some(total as f64 / GIB), "GiB"),
                 ],
             }],
+            top_apps: (self.top_apps > 0)
+                .then(|| self.processes.memory("memory:system", self.top_apps))
+                .into_iter()
+                .collect(),
             ..Default::default()
         }
     }
@@ -303,6 +321,8 @@ impl Sampler {
         let engines = collect(&mut self.engines);
         let memory = collect(&mut self.gpu_memory);
         let mut sections = Vec::new();
+        let mut top_apps = Vec::new();
+        let mut names = None;
         let mut nv_ids = std::collections::HashSet::new();
         let mut nv_failed = false;
         if let Some(nv) = &self.nvml {
@@ -335,6 +355,32 @@ impl Sampler {
                                 .unwrap_or_else(|_| format!("unstable:gpu:nvml:{i}"))
                         });
                         nv_ids.insert(device_id.clone());
+                        if self.top_apps > 0 {
+                            let usage = match matched {
+                                Some(adapter) => Ok(processes::gpu_engine_usage(
+                                    &engines,
+                                    &adapter.luid.pdh_tag(),
+                                )),
+                                None => {
+                                    let since = self.gpu_seen.get(&device_id).copied();
+                                    processes::nvml_usage(&d, since).map(|(usage, seen)| {
+                                        if let Some(seen) = seen {
+                                            self.gpu_seen.insert(device_id.clone(), seen);
+                                        }
+                                        usage
+                                    })
+                                }
+                            };
+                            top_apps.push(match usage {
+                                Ok(usage) => {
+                                    let names = names.get_or_insert_with(|| self.processes.names());
+                                    processes::gpu(&device_id, &usage, names, self.top_apps)
+                                }
+                                Err(reason) => {
+                                    processes::unavailable(Block::Gpu, &device_id, &reason)
+                                }
+                            });
+                        }
                         let mem = d.memory_info().ok();
                         sections.push(Section {
                             disconnected: false,
@@ -401,6 +447,16 @@ impl Sampler {
             }
             let perf = adapter.as_ref().map(|a| a.perf()).unwrap_or_default();
             let tag = info.luid.pdh_tag();
+            if self.top_apps > 0 {
+                let usage = processes::gpu_engine_usage(&engines, &tag);
+                let names = names.get_or_insert_with(|| self.processes.names());
+                top_apps.push(processes::gpu(
+                    &info.device_id,
+                    &usage,
+                    names,
+                    self.top_apps,
+                ));
+            }
             let mut sums = HashMap::<String, f64>::new();
             for (name, v) in &engines {
                 let name = name.to_lowercase();
@@ -453,6 +509,13 @@ impl Sampler {
             });
         }
         if !sections.iter().any(|s| s.id == Block::Gpu) {
+            if self.top_apps > 0 {
+                top_apps.push(processes::unavailable(
+                    Block::Gpu,
+                    "unstable:gpu",
+                    "NVML и WDDM не обнаружили доступную видеокарту",
+                ));
+            }
             sections.push(Section {
                 disconnected: false,
                 id: Block::Gpu,
@@ -469,6 +532,7 @@ impl Sampler {
         self.gpu_ready = true;
         Snapshot {
             sections,
+            top_apps,
             ..Default::default()
         }
     }

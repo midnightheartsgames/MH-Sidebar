@@ -3,7 +3,7 @@ use eframe::egui::{self, Color32, RichText, Stroke, vec2};
 use mh_sidebar::{
     config::Settings,
     history::History,
-    model::{Block, Reading, Snapshot},
+    model::{Block, Reading, Snapshot, TopApps},
 };
 use std::time::Duration;
 
@@ -225,6 +225,11 @@ pub fn show(
                     ),
                 );
             }
+            if block.top_apps() > 0
+                && let Some(top) = snapshot.top_apps(section.id, &section.device_id)
+            {
+                top_apps(ui, top, block.top_apps(), settings);
+            }
             separator(ui);
         }
     }
@@ -287,6 +292,68 @@ fn reading(ui: &mut egui::Ui, row: &Reading, settings: &Settings, block: Block) 
         response.on_hover_text(reason)
     } else {
         response.on_hover_text(&row.label)
+    }
+}
+
+fn top_apps(ui: &mut egui::Ui, top: &TopApps, limit: usize, settings: &Settings) {
+    if top.apps.is_empty() && top.reason.is_some() && settings.hide_unavailable {
+        return;
+    }
+    let size = settings.font_size - 2.;
+    ui.add_space(2.);
+    ui.label(
+        RichText::new(format!("ТОП-{limit} ПРИЛОЖЕНИЙ"))
+            .font(theme::bold(size - 1.))
+            .color(theme::MUTED)
+            .extra_letter_spacing(0.8),
+    );
+    if top.apps.is_empty() {
+        let label = ui.label(
+            RichText::new(if top.reason.is_some() {
+                "Список недоступен"
+            } else {
+                "Нет заметной нагрузки"
+            })
+            .size(size)
+            .color(theme::MUTED),
+        );
+        if let Some(reason) = &top.reason {
+            label.on_hover_text(reason);
+        }
+        return;
+    }
+    for (index, app) in top.apps.iter().take(limit).enumerate() {
+        ui.horizontal(|ui| {
+            let available = ui.available_width();
+            ui.label(
+                RichText::new(format!("{}", index + 1))
+                    .size(size)
+                    .color(theme::MUTED),
+            );
+            ui.allocate_ui_with_layout(
+                vec2(
+                    (available * 0.62 - size).max(0.),
+                    size + settings.density.spacing(),
+                ),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let name = if app.processes > 1 {
+                        format!("{} ×{}", app.name, app.processes)
+                    } else {
+                        app.name.clone()
+                    };
+                    ui.add(
+                        egui::Label::new(RichText::new(name).size(size).color(theme::TEXT))
+                            .truncate(),
+                    );
+                },
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(&app.text).size(size).color(theme::TEXT));
+            });
+        })
+        .response
+        .on_hover_text(format!("{} · процессов: {}", app.name, app.processes));
     }
 }
 

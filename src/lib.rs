@@ -5,6 +5,7 @@ pub mod config;
 pub mod history;
 pub mod model;
 pub mod platform;
+pub mod processes;
 #[cfg(windows)]
 pub mod sensors;
 #[cfg(not(windows))]

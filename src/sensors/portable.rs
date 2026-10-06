@@ -1,4 +1,7 @@
-use crate::model::{Block, DriverStatus, Reading, Section, Snapshot, Source};
+use crate::{
+    model::{Block, DriverStatus, Reading, Section, Snapshot, Source},
+    processes::{self, Processes},
+};
 use nvml_wrapper::{
     Nvml,
     enum_wrappers::device::{Clock, TemperatureSensor},
@@ -26,6 +29,10 @@ pub struct Sampler {
     cpu_at: Option<Instant>,
     disk_at: Option<Instant>,
     network_rates: HashMap<String, (u64, u64, Instant)>,
+    processes: Processes,
+    gpu_seen: HashMap<String, u64>,
+    /// Сколько самых нагруженных приложений собирать для CPU, GPU и ОЗУ; 0 отключает обход процессов.
+    pub top_apps: usize,
 }
 
 impl Default for Sampler {
@@ -45,6 +52,9 @@ impl Sampler {
             cpu_at: None,
             disk_at: None,
             network_rates: HashMap::new(),
+            processes: Processes::default(),
+            gpu_seen: HashMap::new(),
+            top_apps: 0,
         }
     }
 
@@ -125,6 +135,10 @@ impl Sampler {
                     .into(),
                 rows,
             }],
+            top_apps: (self.top_apps > 0)
+                .then(|| self.processes.cpu("cpu:system", self.top_apps))
+                .into_iter()
+                .collect(),
             ..Default::default()
         }
     }
@@ -189,6 +203,10 @@ impl Sampler {
                     row("total", "Всего", Some(total as f64 / GIB), "GiB"),
                 ],
             }],
+            top_apps: (self.top_apps > 0)
+                .then(|| self.processes.memory("memory:system", self.top_apps))
+                .into_iter()
+                .collect(),
             ..Default::default()
         }
     }
@@ -198,6 +216,8 @@ impl Sampler {
             self.nvml = Nvml::init().ok();
         }
         let mut sections = Vec::new();
+        let mut top_apps = Vec::new();
+        let mut names = None;
         if let Some(nvml) = &self.nvml
             && let Ok(count) = nvml.device_count()
         {
@@ -210,6 +230,19 @@ impl Sampler {
                     .uuid()
                     .map(|uuid| format!("gpu:nvml:{}", uuid.to_lowercase()))
                     .unwrap_or_else(|_| format!("unstable:gpu:nvml:{index}"));
+                if self.top_apps > 0 {
+                    let since = self.gpu_seen.get(&id).copied();
+                    top_apps.push(match processes::nvml_usage(&device, since) {
+                        Ok((usage, seen)) => {
+                            if let Some(seen) = seen {
+                                self.gpu_seen.insert(id.clone(), seen);
+                            }
+                            let names = names.get_or_insert_with(|| self.processes.names());
+                            processes::gpu(&id, &usage, names, self.top_apps)
+                        }
+                        Err(reason) => processes::unavailable(Block::Gpu, &id, &reason),
+                    });
+                }
                 sections.push(Section {
                     disconnected: false,
                     id: Block::Gpu,
@@ -274,6 +307,13 @@ impl Sampler {
             }
         }
         if sections.is_empty() {
+            if self.top_apps > 0 {
+                top_apps.push(processes::unavailable(
+                    Block::Gpu,
+                    "unstable:gpu",
+                    "Нагрузку приложений на GPU сообщает только драйвер NVIDIA (NVML)",
+                ));
+            }
             sections.push(Section {
                 disconnected: false,
                 id: Block::Gpu,
@@ -288,6 +328,7 @@ impl Sampler {
         }
         Snapshot {
             sections,
+            top_apps,
             ..Default::default()
         }
     }
