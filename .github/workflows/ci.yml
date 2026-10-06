@@ -92,6 +92,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: MH Sidebar ${{ github.ref_name }}
-          body_path: docs/releases/v0.5.2.md
+          body_path: docs/releases/v0.6.0.md
           files: dist/MH-Sidebar-v*
           fail_on_unmatched_files: true
