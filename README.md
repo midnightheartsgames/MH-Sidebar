@@ -6,7 +6,7 @@ MH Sidebar показывает загрузку CPU и GPU, память, ди�
 
 ## Первый запуск в Windows
 
-1. Распакуйте `MH-Sidebar-v0.5.2-windows-x64.zip` или возьмите `MH-Sidebar.exe` из `dist/v0.5.2/`.
+1. Распакуйте `MH-Sidebar-v0.6.0-windows-x64.zip` или возьмите `MH-Sidebar.exe` из `dist/v0.6.0/`.
 2. Запустите EXE. В открывшихся настройках выберите монитор, сторону и ширину панели, затем нажмите **Готово**. Если монитор один, приложение использует его; при двух по умолчанию выбирается второй.
 3. Если нужен автозапуск с доступом к датчикам PawnIO, подтвердите запрос Windows на повышение прав. Автозапуск включён в начальных настройках. При отказе настройки останутся открытыми, а задача автозапуска не создастся.
 
@@ -96,10 +96,10 @@ cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File tools/build-release.ps1
-powershell -ExecutionPolicy Bypass -File tools/verify-release.ps1 -PackageDirectory dist/v0.5.2 -ExpectedVersion 0.5.2
+powershell -ExecutionPolicy Bypass -File tools/verify-release.ps1 -PackageDirectory dist/v0.6.0 -ExpectedVersion 0.6.0
 ```
 
-Скрипт выпуска берёт версию из `Cargo.toml`, создаёт `dist/v0.5.2/` и ZIP, проверяет состав пакета, SHA-256 файлов и архитектуру EXE. Если каталог версии уже существует, сборка остановится, не заменяя прежний пакет. CI выполняет форматирование, тесты, Clippy и сборку на Windows; аппаратные сценарии и поведение UAC требуют проверки на целевой машине.
+Скрипт выпуска берёт версию из `Cargo.toml`, создаёт `dist/v0.6.0/` и ZIP, проверяет состав пакета, SHA-256 файлов и архитектуру EXE. Если каталог версии уже существует, сборка остановится, не заменяя прежний пакет. CI выполняет форматирование, тесты, Clippy и сборку на Windows; аппаратные сценарии и поведение UAC требуют проверки на целевой машине.
 
 ### Linux и macOS
 
