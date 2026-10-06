@@ -101,14 +101,25 @@ pub struct Snapshot {
     pub sections: Vec<Section>,
     pub cpu_driver: DriverStatus,
     pub cpu_diagnostic: String,
+    pub top_apps: Vec<TopApps>,
 }
 impl Snapshot {
+    pub fn top_apps(&self, block: Block, device_id: &str) -> Option<&TopApps> {
+        self.top_apps
+            .iter()
+            .find(|t| t.block == block && t.device_id == device_id)
+    }
     pub fn merge(&mut self, other: Snapshot) {
         if !other.cpu_diagnostic.is_empty() {
             self.cpu_driver = other.cpu_driver;
             self.cpu_diagnostic = other.cpu_diagnostic;
         }
         self.sources.extend(other.sources);
+        for top in other.top_apps {
+            self.top_apps
+                .retain(|t| t.block != top.block || t.device_id != top.device_id);
+            self.top_apps.push(top);
+        }
         for section in other.sections {
             if let Some(existing) = self
                 .sections
@@ -131,6 +142,22 @@ impl Snapshot {
         });
     }
 }
+/// Приложения, которые сильнее всего нагружают устройство в текущем замере.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopApps {
+    pub block: Block,
+    pub device_id: String,
+    pub apps: Vec<TopApp>,
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopApp {
+    pub name: String,
+    pub processes: usize,
+    pub value: f64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DriverStatus {
     #[default]

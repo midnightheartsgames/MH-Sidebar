@@ -12,7 +12,7 @@ use mh_sidebar::{
     alerts::AlertEngine,
     collection::Collector,
     config::{self, Settings},
-    model::Snapshot,
+    model::{Block, Snapshot},
     platform::{self, DockWindow, Monitor},
 };
 #[cfg(windows)]
@@ -347,6 +347,14 @@ impl App {
         let Some(worker) = &mut self.worker else {
             return;
         };
+        for block in Block::ALL {
+            let count = |settings: &Settings| settings.block(block).map_or(0, |b| b.top_apps());
+            let mut wanted = count(&self.settings);
+            if self.settings_window.open {
+                wanted = wanted.max(count(&self.settings_window.draft));
+            }
+            worker.set_top_apps(block, wanted);
+        }
         self.snapshot = worker.snapshot(now);
         if self.settings.notifications_enabled {
             for alert in self

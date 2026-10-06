@@ -1,12 +1,12 @@
 use crate::{
-    model::{DriverStatus, Snapshot, Source, SourceStatus},
+    model::{Block, DriverStatus, Snapshot, Source, SourceStatus},
     sensors::Sampler,
 };
 use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -145,6 +145,10 @@ impl SourceCache {
                             row.stale = true;
                         }
                     }
+                    for top in &mut snapshot.top_apps {
+                        top.apps.clear();
+                        top.reason = Some(reason.clone());
+                    }
                     if source == Source::CpuDriver {
                         snapshot.cpu_driver = DriverStatus::Unknown;
                         snapshot.cpu_diagnostic = reason;
@@ -167,12 +171,16 @@ pub struct Collector {
     workers: Vec<SourceWorker>,
     cache: SourceCache,
     interval: u64,
+    top_apps: HashMap<Source, Arc<AtomicUsize>>,
 }
 impl Collector {
     pub fn start(interval: u64, wake: impl Fn() + Send + Sync + 'static) -> Result<Self, String> {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let mut workers = Vec::new();
+        let mut top_apps = HashMap::new();
         for source in Source::ALL {
+            let limit = Arc::new(AtomicUsize::new(0));
+            top_apps.insert(source, limit.clone());
             workers.push(SourceWorker::start(
                 source,
                 interval,
@@ -183,6 +191,7 @@ impl Collector {
                         if restart {
                             sampler = Sampler::new();
                         }
+                        sampler.top_apps = limit.load(Ordering::Acquire);
                         sampler.sample_source(source)
                     })
                 },
@@ -192,7 +201,23 @@ impl Collector {
             workers,
             cache: SourceCache::default(),
             interval,
+            top_apps,
         })
+    }
+    /// Сколько самых нагруженных приложений собирать для блока; 0 выключает обход процессов.
+    pub fn set_top_apps(&mut self, block: Block, count: usize) {
+        let source = match block {
+            Block::Cpu => Source::Cpu,
+            Block::Gpu => Source::Gpu,
+            Block::Memory => Source::Memory,
+            _ => return,
+        };
+        if let Some(limit) = self.top_apps.get(&source)
+            && limit.swap(count, Ordering::AcqRel) != count
+            && let Some(worker) = self.workers.iter().find(|w| w.source == source)
+        {
+            worker.wake();
+        }
     }
     pub fn set_interval(&mut self, interval: u64) {
         self.interval = interval;
