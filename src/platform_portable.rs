@@ -36,7 +36,22 @@ pub fn monitors() -> Vec<Monitor> {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "platform_kde.rs"]
+pub mod kde;
+
+#[cfg(target_os = "linux")]
 pub fn monitors() -> Vec<Monitor> {
+    if kde::wayland_session() {
+        let found = kde::monitors();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    xrandr_monitors()
+}
+
+#[cfg(target_os = "linux")]
+fn xrandr_monitors() -> Vec<Monitor> {
     let Ok(output) = Command::new("xrandr").arg("--listmonitors").output() else {
         return Vec::new();
     };
@@ -81,6 +96,8 @@ pub fn monitors() -> Vec<Monitor> {
 pub struct DockWindow {
     context: egui::Context,
     last: Option<(ScreenRect, bool)>,
+    #[cfg(target_os = "linux")]
+    kwin: Option<kde::KwinDock>,
 }
 
 impl DockWindow {
@@ -88,6 +105,8 @@ impl DockWindow {
         Self {
             context,
             last: None,
+            #[cfg(target_os = "linux")]
+            kwin: kde::wayland_session().then(kde::KwinDock::new),
         }
     }
 
@@ -96,6 +115,18 @@ impl DockWindow {
             return Ok(());
         };
         let rect = requested_rect(monitor, settings);
+        // В Wayland клиент не может сам двигать окно: место и слой задаёт скрипт KWin.
+        #[cfg(target_os = "linux")]
+        if let Some(kwin) = &mut self.kwin {
+            return kwin.apply(&kde::Placement {
+                output: monitor.id.clone(),
+                fallback: rect,
+                width: settings.width,
+                side: settings.side,
+                keep_above: settings.always_on_top,
+                visible: settings.visible,
+            });
+        }
         if self.last != Some((rect, settings.always_on_top)) {
             self.context
                 .send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
@@ -162,7 +193,7 @@ fn home() -> Result<PathBuf, String> {
         .ok_or("Не найден домашний каталог".into())
 }
 
-fn runtime_dir() -> PathBuf {
+pub(crate) fn runtime_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join("mh-sidebar");

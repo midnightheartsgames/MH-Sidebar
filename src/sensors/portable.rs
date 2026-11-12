@@ -9,6 +9,10 @@ use nvml_wrapper::{
 use std::{collections::HashMap, time::Instant};
 use sysinfo::{Components, Disks, Networks, System};
 
+#[cfg(target_os = "linux")]
+#[path = "drm.rs"]
+pub mod drm;
+
 const GIB: f64 = 1_073_741_824.0;
 const MIB: f64 = 1_048_576.0;
 
@@ -31,6 +35,8 @@ pub struct Sampler {
     network_rates: HashMap<String, (u64, u64, Instant)>,
     processes: Processes,
     gpu_seen: HashMap<String, u64>,
+    #[cfg(target_os = "linux")]
+    drm: drm::Gpus,
     /// Сколько самых нагруженных приложений собирать для CPU, GPU и ОЗУ; 0 отключает обход процессов.
     pub top_apps: usize,
 }
@@ -54,6 +60,8 @@ impl Sampler {
             network_rates: HashMap::new(),
             processes: Processes::default(),
             gpu_seen: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            drm: drm::Gpus::default(),
             top_apps: 0,
         }
     }
@@ -218,6 +226,8 @@ impl Sampler {
         let mut sections = Vec::new();
         let mut top_apps = Vec::new();
         let mut names = None;
+        #[cfg(target_os = "linux")]
+        let mut nvml_buses = std::collections::HashSet::new();
         if let Some(nvml) = &self.nvml
             && let Ok(count) = nvml.device_count()
         {
@@ -226,6 +236,10 @@ impl Sampler {
                     continue;
                 };
                 let memory = device.memory_info().ok();
+                #[cfg(target_os = "linux")]
+                if let Ok(pci) = device.pci_info() {
+                    nvml_buses.insert(drm::normalize_bus_id(&pci.bus_id));
+                }
                 let id = device
                     .uuid()
                     .map(|uuid| format!("gpu:nvml:{}", uuid.to_lowercase()))
@@ -306,12 +320,18 @@ impl Sampler {
                 });
             }
         }
+        #[cfg(target_os = "linux")]
+        self.drm_gpus(&nvml_buses, &mut sections, &mut top_apps, &mut names);
         if sections.is_empty() {
             if self.top_apps > 0 {
                 top_apps.push(processes::unavailable(
                     Block::Gpu,
                     "unstable:gpu",
-                    "Нагрузку приложений на GPU сообщает только драйвер NVIDIA (NVML)",
+                    if cfg!(target_os = "linux") {
+                        "Видеокарта не найдена ни через NVML, ни через DRM"
+                    } else {
+                        "Нагрузку приложений на GPU сообщает только драйвер NVIDIA (NVML)"
+                    },
                 ));
             }
             sections.push(Section {
@@ -322,7 +342,11 @@ impl Sampler {
                 rows: vec![Reading::unavailable(
                     "load",
                     "Загрузка",
-                    "NVML не обнаружил NVIDIA GPU; системный GPU API пока не подключён",
+                    if cfg!(target_os = "linux") {
+                        "Видеокарта не найдена: NVML не ответил, в /sys/class/drm нет PCI-адаптеров"
+                    } else {
+                        "NVML не обнаружил NVIDIA GPU; системный GPU API пока не подключён"
+                    },
                 )],
             });
         }
@@ -330,6 +354,98 @@ impl Sampler {
             sections,
             top_apps,
             ..Default::default()
+        }
+    }
+
+    /// AMD, Intel и прочие адаптеры через sysfs; карты, уже найденные NVML, пропускаются.
+    #[cfg(target_os = "linux")]
+    fn drm_gpus(
+        &mut self,
+        nvml_buses: &std::collections::HashSet<String>,
+        sections: &mut Vec<Section>,
+        top_apps: &mut Vec<crate::model::TopApps>,
+        names: &mut Option<HashMap<u32, String>>,
+    ) {
+        let cards: Vec<_> = self
+            .drm
+            .cards()
+            .into_iter()
+            .filter(|card| !nvml_buses.contains(&card.address))
+            .collect();
+        if cards.is_empty() {
+            return;
+        }
+        let readings: Vec<_> = cards.iter().map(|card| self.drm.read(card)).collect();
+        let needs_clients =
+            self.top_apps > 0 || readings.iter().any(|reading| reading.load.is_none());
+        let had_history = self.drm.has_client_history();
+        let clients = needs_clients.then(|| self.drm.clients());
+        for (card, reading) in cards.iter().zip(readings) {
+            let id = card.id();
+            let client_load = clients
+                .as_ref()
+                .filter(|_| had_history)
+                .map(|usage| usage.devices.get(&card.address).copied().unwrap_or(0.0));
+            let mut rows = Vec::new();
+            let mut push = |key: &str, label: &str, value: Option<Option<f64>>, unit: &str| {
+                if let Some(value) = value {
+                    rows.push(row(key, label, value, unit));
+                }
+            };
+            match reading.load {
+                Some(load) => push("load", "Загрузка", Some(load), "%"),
+                None if clients.is_some() => push("load", "Загрузка", Some(client_load), "%"),
+                None => {}
+            }
+            push("temperature", "Температура", reading.temperature, "°C");
+            push("clock", "Частота ядра", reading.clock, "MHz");
+            push(
+                "memory_clock",
+                "Частота памяти",
+                reading.memory_clock,
+                "MHz",
+            );
+            let gib = |value: Option<Option<u64>>| value.map(|v| v.map(|b| b as f64 / GIB));
+            push(
+                "vram_used",
+                "Видеопамять занято",
+                gib(reading.vram_used),
+                "GiB",
+            );
+            push(
+                "vram_total",
+                "Видеопамять всего",
+                gib(reading.vram_total),
+                "GiB",
+            );
+            push("power", "Мощность", reading.power, "W");
+            push("fan", "Вентилятор", reading.fan, "%");
+            if rows.is_empty() {
+                rows.push(Reading::unavailable(
+                    "load",
+                    "Загрузка",
+                    &format!("Драйвер {} не отдаёт датчики через sysfs", card.driver),
+                ));
+            }
+            if self.top_apps > 0
+                && let Some(usage) = &clients
+            {
+                top_apps.push(if had_history {
+                    let empty = HashMap::new();
+                    let usage = usage.processes.get(&card.address).unwrap_or(&empty);
+                    let names = names.get_or_insert_with(|| self.processes.names());
+                    processes::gpu(&id, usage, names, self.top_apps)
+                } else {
+                    processes::unavailable(Block::Gpu, &id, "Ожидание второго замера процессов")
+                });
+            }
+            sections.push(Section {
+                disconnected: false,
+                id: Block::Gpu,
+                device_id: id,
+                device: self.drm.name(card),
+                rows,
+            });
         }
     }
 

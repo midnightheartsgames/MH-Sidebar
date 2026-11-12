@@ -64,6 +64,7 @@ pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("MH Sidebar")
+            .with_app_id("mh-sidebar")
             .with_decorations(false)
             .with_transparent(true)
             .with_taskbar(false)

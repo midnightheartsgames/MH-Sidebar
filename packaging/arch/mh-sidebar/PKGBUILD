@@ -1,0 +1,69 @@
+# Maintainer: midnightheartsgames
+# Stable package built from a release tag. On release: bump pkgver, reset pkgrel, run updpkgsums.
+pkgname=mh-sidebar
+pkgver=0.6.0
+pkgrel=1
+pkgdesc="Sidebar with CPU, GPU, memory, disk and network load (MH Monitoring)"
+arch=("x86_64")
+url="https://github.com/midnightheartsgames/MH-Sidebar"
+license=("MIT" "OFL-1.1")
+depends=(
+  "gcc-libs"
+  "glibc"
+  "gtk3"
+  "libayatana-appindicator"
+  "libglvnd"
+  "libxkbcommon"
+  "wayland"
+  "xdotool"
+)
+optdepends=(
+  "hwdata: AMD and Intel GPU names"
+  "kscreen: screen list in KDE Plasma Wayland (kscreen-doctor)"
+  "kdialog: settings import/export dialogs in KDE"
+  "libnotify: alert notifications"
+  "nvidia-utils: NVIDIA GPU sensors via NVML"
+  "xorg-xrandr: screen list in X11 sessions"
+  "zenity: settings import/export dialogs"
+)
+options=("!lto")
+makedepends=("cargo")
+source=(
+  "$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+  "mh-sidebar.desktop"
+)
+sha256sums=('ac8639b7550e95124d9e975d0f10a7e7cb99cfee91dd3ed0d1ba17cfa4fb483e'
+            '66d90902a926fb1cfea00197134dc8fb4716e4c262cce30896ab50df7a1c653d')
+_srcdir="MH-Sidebar-$pkgver"
+_desktop="../mh-sidebar.desktop"
+
+prepare() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n "s/host: //p")"
+}
+
+build() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --bin MH-Sidebar
+}
+
+check() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen
+}
+
+package() {
+  cd "$_srcdir"
+  install -Dm755 target/release/MH-Sidebar "$pkgdir/usr/bin/mh-sidebar"
+  install -Dm644 "$_desktop" "$pkgdir/usr/share/applications/mh-sidebar.desktop"
+  install -Dm644 assets/mh-sidebar.png "$pkgdir/usr/share/pixmaps/mh-sidebar.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/$pkgname/Cuprum-OFL.txt"
+  install -Dm644 THIRD-PARTY.md "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY.md"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

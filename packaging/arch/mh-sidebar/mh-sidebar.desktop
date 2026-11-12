@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=MH Sidebar
+GenericName=System Monitor
+GenericName[ru]=Мониторинг системы
+Comment=CPU, GPU, memory, disk and network sidebar
+Comment[ru]=Боковая панель с загрузкой CPU, GPU, памяти, дисков и сети
+Exec=mh-sidebar
+Icon=mh-sidebar
+Terminal=false
+Categories=System;Monitor;
+Keywords=monitor;cpu;gpu;ram;sensors;
+StartupWMClass=mh-sidebar
+SingleMainWindow=true
