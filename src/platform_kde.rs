@@ -222,6 +222,8 @@ fn scripting(method: &str, args: &[String]) -> Result<String, String> {
         .args([
             "--session",
             "--print-reply=literal",
+            // Не ждать KWin дольше 2 с: выход из программы не должен зависать на D-Bus.
+            "--reply-timeout=2000",
             "--dest=org.kde.KWin",
             "/Scripting",
             &format!("org.kde.kwin.Scripting.{method}"),

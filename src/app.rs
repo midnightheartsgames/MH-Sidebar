@@ -163,6 +163,14 @@ fn current_monitors(context: &egui::Context) -> Vec<Monitor> {
         })
 }
 
+/// Кнопка `×` в панели скрывает её сама, поэтому запрос закрытия окна приходит только извне.
+/// В Linux так закрывает окна менеджер сеанса при выходе и выключении: KDE Plasma ждёт, пока
+/// закроются все окна, и отменённый запрос навсегда останавливает выключение. Поэтому в Linux
+/// запрос закрытия завершает программу, а в Windows и macOS по-прежнему только скрывает панель.
+fn close_request_hides_panel() -> bool {
+    !cfg!(target_os = "linux")
+}
+
 fn autostart_needs_update(previous: bool, next: bool, first_run: bool, legacy: bool) -> bool {
     if first_run {
         next || legacy
@@ -459,8 +467,12 @@ impl eframe::App for App {
             self.exiting = true;
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.exiting {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.settings.visible = false;
+            if close_request_hides_panel() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.settings.visible = false;
+            } else {
+                self.exiting = true;
+            }
         }
         if Instant::now() >= self.next_monitors {
             self.monitors = current_monitors(ctx);
