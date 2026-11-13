@@ -21,6 +21,7 @@ optdepends=(
   "hwdata: AMD and Intel GPU names"
   "kscreen: screen list in KDE Plasma Wayland (kscreen-doctor)"
   "kdialog: settings import/export dialogs in KDE"
+  "libdrm: exact AMD GPU model names (amdgpu.ids)"
   "libnotify: alert notifications"
   "nvidia-utils: NVIDIA GPU sensors via NVML"
   "xorg-xrandr: screen list in X11 sessions"

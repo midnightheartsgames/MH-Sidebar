@@ -22,6 +22,8 @@ pub struct Card {
     pub address: String,
     pub vendor: u16,
     pub device: u16,
+    /// Ревизия чипа: у AMD по ней различаются модели на одном кристалле (RX 6700 / 6700 XT / 6750 XT).
+    pub revision: Option<u8>,
     pub driver: String,
     /// Каталог `/sys/class/drm/cardN`.
     pub card: PathBuf,
@@ -111,10 +113,13 @@ pub fn cards(root: &Path) -> Vec<Card> {
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
+        let revision = read(path.join("revision"))
+            .and_then(|text| u8::from_str_radix(text.trim_start_matches("0x"), 16).ok());
         found.push(Card {
             address,
             vendor,
             device,
+            revision,
             driver,
             card,
             path,
@@ -175,8 +180,25 @@ pub fn lookup_name(pci_ids: &str, vendor: u16, device: u16) -> Option<String> {
     None
 }
 
-pub fn display_name(card: &Card, pci_ids: Option<&str>) -> String {
+/// Маркетинговое имя AMD из `amdgpu.ids` (libdrm) по точной паре «устройство, ревизия».
+pub fn lookup_amdgpu(amdgpu_ids: &str, device: u16, revision: u8) -> Option<String> {
+    amdgpu_ids.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ',');
+        let id = u16::from_str_radix(fields.next()?.trim(), 16).ok()?;
+        let rev = u8::from_str_radix(fields.next()?.trim(), 16).ok()?;
+        let name = fields.next()?.trim();
+        (id == device && rev == revision && !name.is_empty()).then(|| name.to_owned())
+    })
+}
+
+pub fn display_name(card: &Card, pci_ids: Option<&str>, amdgpu_ids: Option<&str>) -> String {
     let vendor = vendor_label(card.vendor);
+    if card.vendor == VENDOR_AMD
+        && let (Some(ids), Some(revision)) = (amdgpu_ids, card.revision)
+        && let Some(name) = lookup_amdgpu(ids, card.device, revision)
+    {
+        return name;
+    }
     match pci_ids.and_then(|ids| lookup_name(ids, card.vendor, card.device)) {
         Some(name)
             if name
@@ -188,6 +210,15 @@ pub fn display_name(card: &Card, pci_ids: Option<&str>) -> String {
         Some(name) => format!("{vendor} {name}"),
         None => format!("{vendor} GPU {:04x}:{:04x}", card.vendor, card.device),
     }
+}
+
+fn amdgpu_ids() -> Option<String> {
+    [
+        "/usr/share/libdrm/amdgpu.ids",
+        "/usr/local/share/libdrm/amdgpu.ids",
+    ]
+    .into_iter()
+    .find_map(|path| fs::read_to_string(path).ok())
 }
 
 fn pci_ids() -> Option<String> {
@@ -478,7 +509,8 @@ impl Gpus {
         if let Some(name) = self.names.get(&card.address) {
             return name.clone();
         }
-        let name = display_name(card, pci_ids().as_deref());
+        let amdgpu = (card.vendor == VENDOR_AMD).then(amdgpu_ids).flatten();
+        let name = display_name(card, pci_ids().as_deref(), amdgpu.as_deref());
         self.names.insert(card.address.clone(), name.clone());
         name
     }
@@ -600,6 +632,7 @@ mod tests {
         write(&device.join("class"), class);
         write(&device.join("vendor"), vendor);
         write(&device.join("device"), "0x73bf\n");
+        write(&device.join("revision"), "0xc1\n");
         fs::create_dir_all(root.join("drm").join(card)).unwrap();
         std::os::unix::fs::symlink(&device, root.join("drm").join(card).join("device")).unwrap();
         device
@@ -616,6 +649,7 @@ mod tests {
         let addresses: Vec<_> = found.iter().map(|c| c.address.as_str()).collect();
         assert_eq!(addresses, ["0000:00:02.0", "0000:03:00.0"]);
         assert_eq!(found[1].vendor, VENDOR_AMD);
+        assert_eq!(found[1].revision, Some(0xc1));
         assert_eq!(found[1].id(), "gpu:pci:0000:03:00.0");
         assert!(found[0].is_intel());
         fs::remove_dir_all(root).unwrap();
@@ -794,21 +828,47 @@ mod tests {
             address: String::new(),
             vendor,
             device,
+            revision: None,
             driver: String::new(),
             card: PathBuf::new(),
             path: PathBuf::new(),
         };
         assert_eq!(
-            display_name(&card(0x1002, 0x73bf), Some(ids)),
+            display_name(&card(0x1002, 0x73bf), Some(ids), None),
             "AMD Radeon RX 6800/6800 XT / 6900 XT"
         );
         assert_eq!(
-            display_name(&card(0x8086, 0x46a6), Some(ids)),
+            display_name(&card(0x8086, 0x46a6), Some(ids), None),
             "Intel Iris Xe Graphics"
         );
         assert_eq!(
-            display_name(&card(0x8086, 0x9999), None),
+            display_name(&card(0x8086, 0x9999), None, None),
             "Intel GPU 8086:9999"
+        );
+        let amdgpu = "# device_id,\trevision_id,\tproduct_name\n1.0.0\n73DF,\tC0,\tAMD Radeon RX 6750 XT\n73DF,\tC1,\tAMD Radeon RX 6700 XT\n73DF,\tDF,\tAMD Radeon RX 6700\n";
+        assert_eq!(
+            lookup_amdgpu(amdgpu, 0x73df, 0xc1).as_deref(),
+            Some("AMD Radeon RX 6700 XT")
+        );
+        assert_eq!(lookup_amdgpu(amdgpu, 0x73df, 0xaa), None);
+        let navi22 = |revision| Card {
+            device: 0x73df,
+            revision,
+            ..card(0x1002, 0x73df)
+        };
+        let ids_navi22 = "1002  Advanced Micro Devices, Inc. [AMD/ATI]\n\t73df  Navi 22 [Radeon RX 6700/6700 XT/6750 XT / 6800M/6850M XT]\n";
+        assert_eq!(
+            display_name(&navi22(Some(0xdf)), Some(ids_navi22), Some(amdgpu)),
+            "AMD Radeon RX 6700"
+        );
+        // Неизвестная ревизия или нет libdrm — общее имя кристалла из pci.ids.
+        assert_eq!(
+            display_name(&navi22(Some(0xaa)), Some(ids_navi22), Some(amdgpu)),
+            "AMD Radeon RX 6700/6700 XT/6750 XT / 6800M/6850M XT"
+        );
+        assert_eq!(
+            display_name(&navi22(Some(0xc1)), Some(ids_navi22), None),
+            "AMD Radeon RX 6700/6700 XT/6750 XT / 6800M/6850M XT"
         );
         assert_eq!(normalize_bus_id("00000000:01:00.0"), "0000:01:00.0");
         assert_eq!(parse_dpm("0: 500Mhz\n1: 2100Mhz *\n"), Some(2100.0));

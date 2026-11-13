@@ -126,7 +126,7 @@ cd MH-Sidebar/packaging/arch/mh-sidebar-git
 makepkg -si
 ```
 
-Для Plasma, названий видеокарт и диалогов полезно поставить дополнительные пакеты: `kscreen` (список экранов в Wayland), `hwdata` (имена GPU), `kdialog` или `zenity` (импорт и экспорт), `libnotify` (уведомления), `nvidia-utils` для NVIDIA. CI проверяет сборку пакета в контейнере Arch Linux на каждый коммит.
+Для Plasma, названий видеокарт и диалогов полезно поставить дополнительные пакеты: `kscreen` (список экранов в Wayland), `hwdata` и `libdrm` (имена GPU; точная модель AMD берётся из `amdgpu.ids` по ревизии чипа), `kdialog` или `zenity` (импорт и экспорт), `libnotify` (уведомления), `nvidia-utils` для NVIDIA. CI проверяет сборку пакета в контейнере Arch Linux на каждый коммит.
 
 Для macOS нужны стабильный Rust и Xcode Command Line Tools:
 
