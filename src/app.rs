@@ -30,6 +30,11 @@ pub fn run() -> eframe::Result {
         platform::SingleInstance::acquire()
     };
     let Some(_instance) = instance else {
+        // Панель уже запущена (возможно, скрыта): просим её показаться.
+        #[cfg(not(windows))]
+        if !platform::show_running_instance() {
+            eprintln!("MH Sidebar уже запущена");
+        }
         return Ok(());
     };
     let path = args
@@ -93,6 +98,13 @@ pub fn run() -> eframe::Result {
             settings_window.open = open;
             settings_window.status = startup_notice.or(loaded.notice);
             let controls = Controls::install(&cc.egui_ctx, &settings.hotkeys);
+            #[cfg(not(windows))]
+            let instance_listener = {
+                let context = cc.egui_ctx.clone();
+                platform::InstanceListener::start(move || {
+                    context.request_repaint_of(ViewportId::ROOT)
+                })
+            };
             let wake_context = cc.egui_ctx.clone();
             let worker = Collector::start(settings.interval_ms, move || {
                 wake_context.request_repaint_of(ViewportId::ROOT)
@@ -117,6 +129,8 @@ pub fn run() -> eframe::Result {
                 #[cfg(debug_assertions)]
                 analytics_qa_opened: false,
                 exiting: false,
+                #[cfg(not(windows))]
+                instance_listener,
                 smoke,
                 last_viewport: None,
                 hotkeys_suspended: false,
@@ -198,6 +212,8 @@ struct App {
     #[cfg(debug_assertions)]
     analytics_qa_opened: bool,
     exiting: bool,
+    #[cfg(not(windows))]
+    instance_listener: Option<platform::InstanceListener>,
     smoke: Option<u64>,
     last_viewport: Option<(bool, bool)>,
     hotkeys_suspended: bool,
@@ -459,6 +475,15 @@ impl eframe::App for App {
             } else {
                 break;
             }
+        }
+        #[cfg(not(windows))]
+        if self
+            .instance_listener
+            .as_ref()
+            .is_some_and(platform::InstanceListener::show_requested)
+            && !self.settings.visible
+        {
+            self.command(Command::ToggleVisible);
         }
         if self
             .smoke

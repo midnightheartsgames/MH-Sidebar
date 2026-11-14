@@ -187,6 +187,58 @@ impl SingleInstance {
     }
 }
 
+fn instance_socket() -> PathBuf {
+    runtime_dir().join("instance.sock")
+}
+
+/// Повторный запуск передаёт работающей копии просьбу показать панель вместо тихого выхода.
+pub fn show_running_instance() -> bool {
+    use std::io::Write;
+    std::os::unix::net::UnixStream::connect(instance_socket())
+        .and_then(|mut stream| stream.write_all(b"show\n"))
+        .is_ok()
+}
+
+/// Принимает просьбы повторных запусков показать панель; работает, пока держится блокировка копии.
+pub struct InstanceListener {
+    requests: std::sync::mpsc::Receiver<()>,
+}
+
+impl InstanceListener {
+    pub fn start(wake: impl Fn() + Send + 'static) -> Option<Self> {
+        use std::io::Read;
+        let path = instance_socket();
+        // Блокировка уже у этой копии, значит файл сокета остался от завершённой.
+        let _ = fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).ok()?;
+        let (sender, requests) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mh-sidebar-instance".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else {
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut request = [0; 16];
+                    let size = stream.read(&mut request).unwrap_or(0);
+                    if request[..size].starts_with(b"show") {
+                        if sender.send(()).is_err() {
+                            return;
+                        }
+                        wake();
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { requests })
+    }
+
+    pub fn show_requested(&self) -> bool {
+        self.requests.try_iter().count() > 0
+    }
+}
+
 fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
